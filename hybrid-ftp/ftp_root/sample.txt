@@ -1,0 +1,10 @@
+This is a sample ASCII text file for testing the Hybrid FTP server.
+
+Lines of text:
+  Line 1: Hello from the FTP test file!
+  Line 2: This file is used to verify STOR and RETR commands.
+  Line 3: If you can upload and download this file correctly, Basic Level works!
+
+Vietnamese characters: xin chào, thế giới, mạng máy tính.
+
+End of file.
