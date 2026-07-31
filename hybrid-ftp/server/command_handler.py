@@ -27,7 +27,7 @@ from typing import Callable, TYPE_CHECKING
 if TYPE_CHECKING:
     from .session import Session
 
-from .session import check_credentials
+from .session import check_credentials, resolve_path
 
 log = logging.getLogger("ftp-server")
 
@@ -266,10 +266,6 @@ def cmd_rnto(session: "Session", args: str) -> tuple[int, str]:
 # ---------------------------------------------------------------------------
 
 def _open_server_data_sock() -> socket.socket:
-    """
-    Open a UDP socket on the fixed server data port (DATA_PORT).
-    Used by STOR to receive incoming file data from the client.
-    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", DATA_PORT))
@@ -278,14 +274,77 @@ def _open_server_data_sock() -> socket.socket:
 
 
 def _open_client_data_sock(client_ip: str) -> tuple[socket.socket, tuple[str, int]]:
-    """
-    Open a UDP socket for sending to the client's data port (CLIENT_DATA_PORT).
-    Returns (sock, client_data_addr).
-    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     client_addr = (client_ip, CLIENT_DATA_PORT)
     return sock, client_addr
 
+def _get_data_socket_and_peer(session: "Session") -> tuple[socket.socket, tuple[str, int] | None, bool]:
+    if session.data_mode == "PASSIVE" and session.pasv_sock:
+        return session.pasv_sock, None, True
+    elif session.data_mode == "ACTIVE" and session.data_peer:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return sock, session.data_peer, False
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return sock, (session.addr[0], CLIENT_DATA_PORT), False
+
+
+def _send_over_data_channel(session: "Session", data: bytes) -> None:
+    sock, peer, is_pasv = _get_data_socket_and_peer(session)
+    try:
+        if is_pasv and sock:
+            sock.settimeout(5.0)  
+            try:
+                _, peer = sock.recvfrom(1024)
+            except (socket.timeout, OSError):
+                log.error("PASV mode: Timeout waiting for client UDP datagram")
+                return
+
+        if peer:
+            for i in range(0, len(data), CHUNK_SIZE):
+                chunk = data[i:i + CHUNK_SIZE]
+                sock.sendto(chunk, peer)
+            sock.sendto(b"", peer)  
+    except Exception as exc:
+        log.error("Error sending data over UDP channel: %s", exc)
+    finally:
+        if session.pasv_sock:
+            session.pasv_sock.close()
+            session.pasv_sock = None
+            session.data_mode = "NONE"
+        elif sock and not is_pasv:
+            sock.close()
+            session.data_mode = "NONE"
+
+
+def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "wb") -> None:
+    sock, _, is_pasv = _get_data_socket_and_peer(session)
+    
+    if not is_pasv and session.data_mode != "PASSIVE" and sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", DATA_PORT))
+        except OSError:
+            pass
+        
+    if sock:
+        sock.settimeout(10.0)
+        try:
+            with open(target_path, mode) as f:
+                while True:
+                    try:
+                        chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
+                    except socket.timeout:
+                        break
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        finally:
+            if session.pasv_sock:
+                session.pasv_sock.close()
+                session.pasv_sock = None
+            else:
+                sock.close()
 
 # ---------------------------------------------------------------------------
 # File transfer commands
@@ -363,3 +422,179 @@ def cmd_stor(session: "Session", args: str) -> tuple[int, str]:
         return 451, f"Requested action aborted: {exc}"
     finally:
         data_sock.close()
+
+@command("CWD")
+def cmd_cwd(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+
+    target = resolve_path(session, args.strip())
+    if target is None or not target.is_dir():
+        return 550, "Directory unavailable"
+    
+    session.cwd = target
+    return 250, f"Directory changed to {target.name or '/'}"
+
+
+@command("CDUP")
+def cmd_cdup(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+
+    parent = session.cwd.parent
+    root = session.root.resolve()
+    
+    if root not in parent.parents and parent != root:
+        parent = root
+        
+    session.cwd = parent
+    return 250, "Directory changed to parent"
+
+
+@command("MKD")
+def cmd_mkd(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+
+    target = resolve_path(session, args.strip())
+    if target is None:
+        return 550, "Invalid path"
+    
+    try:
+        target.mkdir(parents=False, exist_ok=False)
+        return 257, f'"{args.strip()}" directory created'
+    except FileExistsError:
+        return 550, "Directory already exists"
+    except OSError as exc:
+        return 450, f"Error creating directory: {exc}"
+
+
+@command("RMD")
+def cmd_rmd(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+
+    target = resolve_path(session, args.strip())
+    if target is None or not target.is_dir():
+        return 550, "Directory unavailable"
+    
+    try:
+        target.rmdir()
+        return 250, "Directory removed"
+    except OSError:
+        return 550, "Directory not empty or cannot be removed"
+
+
+@command("LIST")
+def cmd_list(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+
+    target = resolve_path(session, args.strip()) if args.strip() else session.cwd
+    if target is None or not target.is_dir():
+        return 550, "Directory unavailable"
+
+    lines = []
+    for entry in sorted(target.iterdir()):
+        st = entry.stat()
+        kind = "d" if entry.is_dir() else "-"
+        lines.append(f"{kind} {st.st_size:>10} {entry.name}")
+    
+    data = "\r\n".join(lines).encode("utf-8")
+    _send_over_data_channel(session, data)
+    return 226, "Directory listing complete"
+
+
+@command("NLST")
+def cmd_nlst(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+
+    target = resolve_path(session, args.strip()) if args.strip() else session.cwd
+    if target is None or not target.is_dir():
+        return 550, "Directory unavailable"
+
+    names = "\r\n".join(sorted(e.name for e in target.iterdir()))
+    _send_over_data_channel(session, names.encode("utf-8"))
+    return 226, "Transfer complete"
+
+
+@command("STOU")
+def cmd_stou(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+
+    import uuid
+    unique_name = f"{uuid.uuid4().hex[:8]}_{args.strip() or 'file'}"
+    target = session.cwd / unique_name
+    
+    _recv_over_data_channel(session, target)
+    return 226, f"Transfer complete, stored as {unique_name}"
+
+
+@command("APPE")
+def cmd_appe(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+
+    target = resolve_path(session, args.strip())
+    if target is None:
+        return 550, "Invalid path"
+
+    _recv_over_data_channel(session, target, mode="ab")
+    return 226, "Transfer complete"
+
+
+# ---------------------------------------------------------------------------
+# PORT and PASV commands
+# ---------------------------------------------------------------------------
+
+@command("PASV")
+def cmd_pasv(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+
+    data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    data_sock.bind(("0.0.0.0", 0))
+    data_sock.settimeout(10.0)
+    
+    _, port = data_sock.getsockname()
+    session.pasv_sock = data_sock
+    session.data_mode = "PASSIVE"
+
+    server_ip = session.ctrl_sock.getsockname()[0]
+    if server_ip == "0.0.0.0":
+        server_ip = "127.0.0.1"
+
+    ip_parts = server_ip.split(".")
+    p1, p2 = port >> 8, port & 0xFF
+    
+    pasv_str = f"{','.join(ip_parts)},{p1},{p2}"
+    return 227, f"Entering Passive Mode ({pasv_str})"
+
+
+@command("PORT")
+def cmd_port(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+
+    try:
+        parts = list(map(int, args.strip().split(",")))
+        ip = ".".join(map(str, parts[:4]))
+        port = (parts[4] << 8) + parts[5]
+        
+        session.data_peer = (ip, port)
+        session.data_mode = "ACTIVE"
+        return 200, "PORT command successful"
+    except Exception:
+        return 501, "Syntax error in parameters"

@@ -63,6 +63,7 @@ def _recv_file_udp(out_path: Path, timeout: float = 10.0) -> int:
     Returns total bytes received.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", CLIENT_DATA_PORT))
     sock.settimeout(timeout)
     total = 0
@@ -148,6 +149,8 @@ def run_client(host: str, port: int) -> None:
                 print("[ERROR] No data received (check server logs)")
             continue
 
+        
+
         # ----------------------------------------------------------------
         # All other commands — send and print reply
         # ----------------------------------------------------------------
@@ -160,3 +163,26 @@ def run_client(host: str, port: int) -> None:
             break
 
     ctrl_sock.close()
+
+def _recv_text_udp(timeout: float = 5.0) -> str:
+    """
+    Nhận dữ liệu văn bản (dùng cho LIST / NLST) từ Server qua UDP port 2123.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", CLIENT_DATA_PORT))
+    sock.settimeout(timeout)
+    chunks = []
+    try:
+        while True:
+            try:
+                chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
+            except socket.timeout:
+                break
+            if not chunk:   # Empty datagram = EOF
+                break
+            chunks.append(chunk)
+    finally:
+        sock.close()
+    
+    return b"".join(chunks).decode("utf-8", errors="replace")

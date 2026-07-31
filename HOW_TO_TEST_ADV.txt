@@ -1,0 +1,24 @@
+B1: vào terminal
+cd hybrid-ftp
+python -m server.main --port 2121 --root ./ftp_root
+
+B2: mở 1 new terminal khác
+cd hybrid-ftp
+python -m client.main --port 2121
+USER admin
+PASS 1234
+MKD test_folder
+CWD test_folder
+PWD
+CDUP
+CWD ../../../
+PWD
+LIST
+TYPE I
+STOR sample.jpg
+Get-FileHash ftp_root/sample.jpg -Algorithm SHA25
+RNFR sample.jpg
+RNTO renamed_sample.jpg
+DELE renamed_sample.jpg
+PASV
+PORT 127,0,0,1,8,75
