@@ -54,7 +54,6 @@ def command(name: str):
         return fn
     return deco
 
-
 def dispatch(session: "Session", cmd: str, args: str) -> tuple[int, str]:
     """Look up and call the handler for *cmd*, or return 502 if unknown."""
     handler = COMMANDS.get(cmd)
