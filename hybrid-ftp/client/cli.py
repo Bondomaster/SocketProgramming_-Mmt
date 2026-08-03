@@ -123,14 +123,23 @@ def run_client(host: str, port: int) -> None:
             if not local_path.is_file():
                 print(f"[ERROR] Local file not found: {local_path}")
                 continue
+
             # Tell server we want to upload
             ctrl_sock.sendall(f"STOR {local_path.name}\r\n".encode())
-            print(f"[STATUS] Uploading '{local_path.name}' ...")
-            bytes_sent = _send_file_udp(host, local_path)
-            # Now read the server's reply
-            reply = recv_reply(ctrl_sock)
-            print(f"<<  {reply}")
-            print(f"[STATUS] Upload complete — {bytes_sent} bytes sent")
+
+            initial_reply = recv_reply(ctrl_sock)
+            print(f"<<  {initial_reply}")
+
+            if initial_reply.startswith("150"):
+                print(f"[STATUS] Uploading '{local_path.name}' ...")
+                bytes_sent = _send_file_udp(host, local_path)
+                
+                # Now read the server's final reply (e.g., 226)
+                final_reply = recv_reply(ctrl_sock)
+                print(f"<<  {final_reply}")
+                print(f"[STATUS] Upload complete — {bytes_sent} bytes sent")
+            else:
+                print("[ERROR] Upload aborted.")
             continue
 
         # ----------------------------------------------------------------
@@ -138,18 +147,24 @@ def run_client(host: str, port: int) -> None:
         # ----------------------------------------------------------------
         if cmd == "RETR":
             ctrl_sock.sendall(f"RETR {args}\r\n".encode())
-            out_path = Path(args).name   # save to current directory
-            print(f"[STATUS] Downloading '{args}' → '{out_path}' ...")
-            bytes_recv = _recv_file_udp(Path(out_path))
-            reply = recv_reply(ctrl_sock)
-            print(f"<<  {reply}")
-            if bytes_recv > 0:
-                print(f"[STATUS] Download complete — {bytes_recv} bytes received → {out_path}")
+            initial_reply = recv_reply(ctrl_sock)
+            print(f"<<  {initial_reply}")
+            if initial_reply.startswith("150"):
+                out_path = Path(args).name   # save to current directory
+                print(f"[STATUS] Downloading '{args}' → '{out_path}' ...")
+                bytes_recv = _recv_file_udp(Path(out_path))
+                
+                # Read the server's final reply (e.g., 226)
+                final_reply = recv_reply(ctrl_sock)
+                print(f"<<  {final_reply}")
+                
+                if bytes_recv > 0:
+                    print(f"[STATUS] Download complete — {bytes_recv} bytes received → {out_path}")
+                else:
+                    print("[ERROR] No data received (check server logs)")
             else:
-                print("[ERROR] No data received (check server logs)")
+                print("[ERROR] Download aborted.")
             continue
-
-        
 
         # ----------------------------------------------------------------
         # All other commands — send and print reply

@@ -1,3 +1,0 @@
-# No third-party runtime dependencies — stdlib only
-# For development/testing only:
-# pytest

@@ -16,7 +16,7 @@ PWD
 LIST
 TYPE I
 STOR sample.jpg
-Get-FileHash ftp_root/sample.jpg -Algorithm SHA25
+Get-FileHash ftp_root/sample.jpg -Algorithm SHA256
 RNFR sample.jpg
 RNTO renamed_sample.jpg
 DELE renamed_sample.jpg

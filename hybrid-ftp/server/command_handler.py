@@ -61,7 +61,6 @@ def dispatch(session: "Session", cmd: str, args: str) -> tuple[int, str]:
         return 502, "Command not implemented"
     return handler(session, args)
 
-
 # ---------------------------------------------------------------------------
 # Auth guard helper
 # ---------------------------------------------------------------------------
@@ -71,7 +70,6 @@ def _require_auth(session: "Session") -> tuple[int, str] | None:
     if not session.authenticated:
         return 530, "Not logged in"
     return None
-
 
 # ---------------------------------------------------------------------------
 # Authentication commands
@@ -96,7 +94,6 @@ def cmd_pass(session: "Session", args: str) -> tuple[int, str]:
     log.warning("FAILED LOGIN  user=%s addr=%s", session.username, session.addr)
     return 530, "Not logged in — wrong password"
 
-
 # ---------------------------------------------------------------------------
 # Session control commands
 # ---------------------------------------------------------------------------
@@ -109,7 +106,6 @@ def cmd_quit(session: "Session", args: str) -> tuple[int, str]:
 @command("NOOP")
 def cmd_noop(session: "Session", args: str) -> tuple[int, str]:
     return 200, "Command OK"
-
 
 # ---------------------------------------------------------------------------
 # Info/status commands
@@ -365,6 +361,7 @@ def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
 
     client_ip = session.addr[0]
     data_sock, client_data_addr = _open_client_data_sock(client_ip)
+    session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
 
     try:
         total_bytes = 0
@@ -399,6 +396,7 @@ def cmd_stor(session: "Session", args: str) -> tuple[int, str]:
 
     target = session.cwd / args.strip()
     data_sock = _open_server_data_sock()
+    session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
 
     try:
         total_bytes = 0
@@ -562,6 +560,10 @@ def cmd_pasv(session: "Session", args: str) -> tuple[int, str]:
     if err:
         return err
 
+    if session.pasv_sock:
+        session.pasv_sock.close()
+        session.pasv_sock = None
+        
     data_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     data_sock.bind(("0.0.0.0", 0))
     data_sock.settimeout(10.0)
@@ -586,6 +588,10 @@ def cmd_port(session: "Session", args: str) -> tuple[int, str]:
     err = _require_auth(session)
     if err:
         return err
+
+    if session.pasv_sock:
+        session.pasv_sock.close()
+        session.pasv_sock = None
 
     try:
         parts = list(map(int, args.strip().split(",")))
