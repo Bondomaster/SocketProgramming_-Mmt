@@ -1,46 +1,37 @@
 """
 client/cli.py
 =============
-Interactive CLI for the Basic Level Hybrid FTP client.
+Interactive CLI for the Advanced Level Hybrid FTP client.
 
 Handles the command-read-print loop and the special logic for file transfer
-commands (STOR/RETR) that require a parallel UDP data channel.
+commands (STOR/RETR/LIST/NLST) that require a parallel UDP data channel.
 
-UDP Data Channel (Basic Level — fixed ports, mirrors server):
-  - STOR: client opens UDP port CLIENT_DATA_PORT (2123), sends chunks to server DATA_PORT (2122)
-  - RETR: client opens UDP port CLIENT_DATA_PORT (2123), receives chunks from server
-
-EOF is signalled by an empty datagram b"".
+UDP Data Channel:
+  - Uses PASV mode to get an ephemeral UDP port from the server to ensure concurrency.
+  - Checks expected sizes for RETR/STOR to catch silent UDP corruption/loss.
 """
 
 from __future__ import annotations
 
+import re
 import socket
 from pathlib import Path
 
 from common.protocol import format_reply, recv_reply
 
-# ---------------------------------------------------------------------------
-# Fixed UDP port config (must match server/command_handler.py)
-# ---------------------------------------------------------------------------
-
-SERVER_DATA_PORT = 2122    # Server listens here for STOR uploads
-CLIENT_DATA_PORT = 2123    # Client listens here for RETR downloads
 CHUNK_SIZE = 1024
-
 
 # ---------------------------------------------------------------------------
 # UDP helpers
 # ---------------------------------------------------------------------------
 
-def _send_file_udp(server_ip: str, local_path: Path) -> int:
+def _send_file_udp(dest_addr: tuple[str, int], local_path: Path) -> int:
     """
     Upload *local_path* to the server via UDP (STOR helper).
     Chunks the file into CHUNK_SIZE datagrams, ends with empty datagram.
     Returns total bytes sent.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    dest = (server_ip, SERVER_DATA_PORT)
     total = 0
     try:
         with open(local_path, "rb") as f:
@@ -48,26 +39,25 @@ def _send_file_udp(server_ip: str, local_path: Path) -> int:
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
                     break
-                sock.sendto(chunk, dest)
+                sock.sendto(chunk, dest_addr)
                 total += len(chunk)
-        sock.sendto(b"", dest)   # EOF signal
+        sock.sendto(b"", dest_addr)   # EOF signal
     finally:
         sock.close()
     return total
 
 
-def _recv_file_udp(out_path: Path, timeout: float = 10.0) -> int:
+def _recv_file_udp(server_addr: tuple[str, int], out_path: Path, timeout: float = 10.0) -> int:
     """
     Download a file from the server via UDP (RETR helper).
-    Binds CLIENT_DATA_PORT, receives chunks until empty datagram.
+    Sends dummy datagram to punch hole for PASV, receives chunks until empty datagram.
     Returns total bytes received.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", CLIENT_DATA_PORT))
     sock.settimeout(timeout)
     total = 0
     try:
+        sock.sendto(b"HELLO", server_addr) # punch hole / inform server of port
         with open(out_path, "wb") as f:
             while True:
                 try:
@@ -83,6 +73,37 @@ def _recv_file_udp(out_path: Path, timeout: float = 10.0) -> int:
         sock.close()
     return total
 
+def _recv_text_udp(server_addr: tuple[str, int], timeout: float = 5.0) -> str:
+    """
+    Receive text data (for LIST / NLST) from Server via UDP.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    chunks = []
+    try:
+        sock.sendto(b"HELLO", server_addr) # punch hole
+        while True:
+            try:
+                chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
+            except socket.timeout:
+                break
+            if not chunk:   # Empty datagram = EOF
+                break
+            chunks.append(chunk)
+    finally:
+        sock.close()
+    
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def parse_pasv_reply(reply: str) -> tuple[str, int] | None:
+    match = re.search(r'\((\d+,\d+,\d+,\d+,\d+,\d+)\)', reply)
+    if not match:
+        return None
+    parts = list(map(int, match.group(1).split(',')))
+    ip = f"{parts[0]}.{parts[1]}.{parts[2]}.{parts[3]}"
+    port = (parts[4] << 8) + parts[5]
+    return ip, port
 
 # ---------------------------------------------------------------------------
 # Main client loop
@@ -115,60 +136,90 @@ def run_client(host: str, port: int) -> None:
         cmd = parts[0].upper()
         args = parts[1] if len(parts) > 1 else ""
 
-        # ----------------------------------------------------------------
-        # STOR — special handling: send file over UDP, then wait for reply
-        # ----------------------------------------------------------------
-        if cmd == "STOR":
-            local_path = Path(args)
-            if not local_path.is_file():
-                print(f"[ERROR] Local file not found: {local_path}")
+        if cmd in ("STOR", "RETR", "LIST", "NLST"):
+            # 1. Issue PASV
+            ctrl_sock.sendall(b"PASV\r\n")
+            pasv_reply = recv_reply(ctrl_sock)
+            print(f"<<  {pasv_reply}")
+            pasv_addr = parse_pasv_reply(pasv_reply)
+            if not pasv_addr:
+                print("[ERROR] PASV failed, aborting command")
                 continue
 
-            # Tell server we want to upload
-            ctrl_sock.sendall(f"STOR {local_path.name}\r\n".encode())
+            if cmd == "STOR":
+                local_path = Path(args)
+                if not local_path.is_file():
+                    print(f"[ERROR] Local file not found: {local_path}")
+                    continue
+                file_size = local_path.stat().st_size
+                ctrl_sock.sendall(f"STOR {local_path.name}\r\n".encode())
+                initial_reply = recv_reply(ctrl_sock)
+                print(f"<<  {initial_reply}")
 
-            initial_reply = recv_reply(ctrl_sock)
-            print(f"<<  {initial_reply}")
-
-            if initial_reply.startswith("150"):
-                print(f"[STATUS] Uploading '{local_path.name}' ...")
-                bytes_sent = _send_file_udp(host, local_path)
-                
-                # Now read the server's final reply (e.g., 226)
-                final_reply = recv_reply(ctrl_sock)
-                print(f"<<  {final_reply}")
-                print(f"[STATUS] Upload complete — {bytes_sent} bytes sent")
-            else:
-                print("[ERROR] Upload aborted.")
-            continue
-
-        # ----------------------------------------------------------------
-        # RETR — special handling: receive file over UDP, then print reply
-        # ----------------------------------------------------------------
-        if cmd == "RETR":
-            ctrl_sock.sendall(f"RETR {args}\r\n".encode())
-            initial_reply = recv_reply(ctrl_sock)
-            print(f"<<  {initial_reply}")
-            if initial_reply.startswith("150"):
-                out_path = Path(args).name   # save to current directory
-                print(f"[STATUS] Downloading '{args}' → '{out_path}' ...")
-                bytes_recv = _recv_file_udp(Path(out_path))
-                
-                # Read the server's final reply (e.g., 226)
-                final_reply = recv_reply(ctrl_sock)
-                print(f"<<  {final_reply}")
-                
-                if bytes_recv > 0:
-                    print(f"[STATUS] Download complete — {bytes_recv} bytes received → {out_path}")
+                if initial_reply.startswith("150"):
+                    print(f"[STATUS] Uploading '{local_path.name}' ({file_size} bytes) ...")
+                    bytes_sent = _send_file_udp(pasv_addr, local_path)
+                    final_reply = recv_reply(ctrl_sock)
+                    print(f"<<  {final_reply}")
+                    
+                    match = re.search(r'\((\d+)\s+bytes\)', final_reply)
+                    if match:
+                        server_bytes = int(match.group(1))
+                        if server_bytes == file_size:
+                            print(f"[STATUS] Upload complete and verified ({file_size} bytes).")
+                        else:
+                            print(f"[ERROR] UDP data loss! Sent {file_size} bytes, but server received {server_bytes}.")
+                    else:
+                        print(f"[STATUS] Upload complete — {bytes_sent} bytes sent")
                 else:
-                    print("[ERROR] No data received (check server logs)")
-            else:
-                print("[ERROR] Download aborted.")
+                    print("[ERROR] Upload aborted.")
+            
+            elif cmd == "RETR":
+                expected_size = -1
+                ctrl_sock.sendall(f"SIZE {args}\r\n".encode())
+                size_reply = recv_reply(ctrl_sock)
+                if size_reply.startswith("213"):
+                    expected_size = int(size_reply.split()[1])
+
+                ctrl_sock.sendall(f"RETR {args}\r\n".encode())
+                initial_reply = recv_reply(ctrl_sock)
+                print(f"<<  {initial_reply}")
+                if initial_reply.startswith("150"):
+                    out_path = Path(args).name
+                    print(f"[STATUS] Downloading '{args}' → '{out_path}' ...")
+                    bytes_recv = _recv_file_udp(pasv_addr, Path(out_path))
+                    final_reply = recv_reply(ctrl_sock)
+                    print(f"<<  {final_reply}")
+                    
+                    if expected_size != -1:
+                        if bytes_recv == expected_size:
+                            print(f"[STATUS] Download complete and verified ({bytes_recv} bytes) → {out_path}")
+                        else:
+                            print(f"[ERROR] UDP data loss! Expected {expected_size} bytes, but received {bytes_recv}.")
+                    elif bytes_recv > 0:
+                        print(f"[STATUS] Download complete — {bytes_recv} bytes received → {out_path}")
+                    else:
+                        print("[ERROR] No data received (check server logs)")
+                else:
+                    print("[ERROR] Download aborted.")
+            
+            elif cmd in ("LIST", "NLST"):
+                ctrl_sock.sendall((raw + "\r\n").encode())
+                initial_reply = recv_reply(ctrl_sock)
+                print(f"<<  {initial_reply}")
+                
+                if initial_reply.startswith("150") or initial_reply.startswith("125"):
+                    text = _recv_text_udp(pasv_addr)
+                    if text:
+                        print(text, end="")
+                        if not text.endswith('\n'):
+                            print()
+                    final_reply = recv_reply(ctrl_sock)
+                    print(f"<<  {final_reply}")
+            
             continue
 
-        # ----------------------------------------------------------------
-        # All other commands — send and print reply
-        # ----------------------------------------------------------------
+        # All other commands
         ctrl_sock.sendall((raw + "\r\n").encode())
         reply = recv_reply(ctrl_sock)
         print(f"<<  {reply}")
@@ -178,26 +229,3 @@ def run_client(host: str, port: int) -> None:
             break
 
     ctrl_sock.close()
-
-def _recv_text_udp(timeout: float = 5.0) -> str:
-    """
-    Nhận dữ liệu văn bản (dùng cho LIST / NLST) từ Server qua UDP port 2123.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", CLIENT_DATA_PORT))
-    sock.settimeout(timeout)
-    chunks = []
-    try:
-        while True:
-            try:
-                chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
-            except socket.timeout:
-                break
-            if not chunk:   # Empty datagram = EOF
-                break
-            chunks.append(chunk)
-    finally:
-        sock.close()
-    
-    return b"".join(chunks).decode("utf-8", errors="replace")

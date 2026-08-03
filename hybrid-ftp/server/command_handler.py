@@ -312,7 +312,7 @@ def _send_over_data_channel(session: "Session", data: bytes) -> None:
             session.data_mode = "NONE"
 
 
-def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "wb") -> None:
+def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "wb") -> int:
     sock, _, is_pasv = _get_data_socket_and_peer(session)
     
     if not is_pasv and session.data_mode != "PASSIVE" and sock:
@@ -322,6 +322,7 @@ def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "
         except OSError:
             pass
         
+    total_bytes = 0
     if sock:
         sock.settimeout(10.0)
         try:
@@ -334,12 +335,16 @@ def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "
                     if not chunk:
                         break
                     f.write(chunk)
+                    total_bytes += len(chunk)
         finally:
             if session.pasv_sock:
                 session.pasv_sock.close()
                 session.pasv_sock = None
+                session.data_mode = "NONE"
             else:
                 sock.close()
+                session.data_mode = "NONE"
+    return total_bytes
 
 # ---------------------------------------------------------------------------
 # File transfer commands
@@ -359,29 +364,44 @@ def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
     if not target.is_file():
         return 550, f"File unavailable: {args}"
 
-    client_ip = session.addr[0]
-    data_sock, client_data_addr = _open_client_data_sock(client_ip)
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
 
     try:
         total_bytes = 0
-        log.info("RETR   %s → %s:%d", target.name, *client_data_addr)
-        with open(target, "rb") as f:
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                data_sock.sendto(chunk, client_data_addr)
-                total_bytes += len(chunk)
-        # Signal EOF with an empty datagram
-        data_sock.sendto(b"", client_data_addr)
-        log.info("RETR   complete  file=%s  bytes=%d", target.name, total_bytes)
+        sock, peer, is_pasv = _get_data_socket_and_peer(session)
+        
+        if is_pasv and sock:
+            sock.settimeout(5.0)  
+            try:
+                _, peer = sock.recvfrom(1024)
+            except (socket.timeout, OSError):
+                log.error("PASV mode: Timeout waiting for client UDP datagram")
+                return 425, "Can't open data connection"
+
+        if peer:
+            log.info("RETR   %s → %s:%d", target.name, *peer)
+            with open(target, "rb") as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    sock.sendto(chunk, peer)
+                    total_bytes += len(chunk)
+            # Signal EOF with an empty datagram
+            sock.sendto(b"", peer)
+            log.info("RETR   complete  file=%s  bytes=%d", target.name, total_bytes)
         return 226, f"Transfer complete ({total_bytes} bytes)"
     except OSError as exc:
         log.error("RETR   error  %s", exc)
         return 451, f"Requested action aborted: {exc}"
     finally:
-        data_sock.close()
+        if session.pasv_sock:
+            session.pasv_sock.close()
+            session.pasv_sock = None
+            session.data_mode = "NONE"
+        elif sock and not is_pasv:
+            sock.close()
+            session.data_mode = "NONE"
 
 
 @command("STOR")
@@ -395,30 +415,16 @@ def cmd_stor(session: "Session", args: str) -> tuple[int, str]:
         return err
 
     target = session.cwd / args.strip()
-    data_sock = _open_server_data_sock()
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
 
     try:
-        total_bytes = 0
-        log.info("STOR   waiting on UDP port %d  file=%s", DATA_PORT, target.name)
-        with open(target, "wb") as f:
-            while True:
-                try:
-                    chunk, _ = data_sock.recvfrom(CHUNK_SIZE + 64)
-                except socket.timeout:
-                    log.warning("STOR   timed out waiting for data  file=%s", target.name)
-                    return 426, "Connection closed; transfer aborted (timeout)"
-                if not chunk:   # empty datagram = EOF signal
-                    break
-                f.write(chunk)
-                total_bytes += len(chunk)
+        log.info("STOR   waiting on data channel  file=%s", target.name)
+        total_bytes = _recv_over_data_channel(session, target, mode="wb")
         log.info("STOR   complete  file=%s  bytes=%d", target.name, total_bytes)
         return 226, f"Transfer complete ({total_bytes} bytes)"
     except OSError as exc:
         log.error("STOR   error  %s", exc)
         return 451, f"Requested action aborted: {exc}"
-    finally:
-        data_sock.close()
 
 @command("CWD")
 def cmd_cwd(session: "Session", args: str) -> tuple[int, str]:
