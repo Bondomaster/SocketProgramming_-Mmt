@@ -23,14 +23,10 @@ import logging
 import socket
 import threading
 from pathlib import Path
-
 from common.protocol import format_reply, parse_command, read_line
 from server.session import Session
 from server.command_handler import dispatch
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     format="[%(asctime)s] %(levelname)-8s %(message)s",
@@ -38,10 +34,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("ftp-server")
-
-# ---------------------------------------------------------------------------
-# Connected-client registry (shared across threads — protected by a lock)
-# ---------------------------------------------------------------------------
 
 clients_lock = threading.Lock()
 clients: dict[int, dict] = {}
@@ -56,10 +48,6 @@ def unregister_client(session_id: int) -> None:
     with clients_lock:
         clients.pop(session_id, None)
 
-
-# ---------------------------------------------------------------------------
-# Session worker — handles one connected client (runs inside its own thread)
-# ---------------------------------------------------------------------------
 
 def session_worker(ctrl_sock: socket.socket, addr: tuple[str, int], root: Path) -> None:
     """
@@ -112,10 +100,6 @@ def session_worker(ctrl_sock: socket.socket, addr: tuple[str, int], root: Path) 
             pass
 
 
-# ---------------------------------------------------------------------------
-# Server main loop
-# ---------------------------------------------------------------------------
-
 def run_server(host: str = "0.0.0.0", port: int = 2121, root: Path = Path("./ftp_root")) -> None:
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -140,10 +124,6 @@ def run_server(host: str = "0.0.0.0", port: int = 2121, root: Path = Path("./ftp
     finally:
         listen_sock.close()
 
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Hybrid FTP Server")

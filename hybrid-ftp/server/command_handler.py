@@ -23,25 +23,16 @@ import logging
 import socket
 from pathlib import Path
 from typing import Callable, TYPE_CHECKING
-
 if TYPE_CHECKING:
     from .session import Session
-
 from .session import check_credentials, resolve_path
 
 log = logging.getLogger("ftp-server")
 
-# ---------------------------------------------------------------------------
-# UDP data channel ports (Basic Level: fixed, no negotiation)
-# ---------------------------------------------------------------------------
 
 DATA_PORT = 2122        # Server's UDP port (STOR: server listens here)
 CLIENT_DATA_PORT = 2123 # Client's UDP port (RETR: client listens here)
 CHUNK_SIZE = 1024       # bytes per UDP datagram for file transfer
-
-# ---------------------------------------------------------------------------
-# Command dispatch table
-# ---------------------------------------------------------------------------
 
 Handler = Callable[["Session", str], tuple[int, str]]
 COMMANDS: dict[str, Handler] = {}
@@ -61,19 +52,11 @@ def dispatch(session: "Session", cmd: str, args: str) -> tuple[int, str]:
         return 502, "Command not implemented"
     return handler(session, args)
 
-# ---------------------------------------------------------------------------
-# Auth guard helper
-# ---------------------------------------------------------------------------
-
 def _require_auth(session: "Session") -> tuple[int, str] | None:
     """Return a 530 reply tuple if the session is not authenticated, else None."""
     if not session.authenticated:
         return 530, "Not logged in"
     return None
-
-# ---------------------------------------------------------------------------
-# Authentication commands
-# ---------------------------------------------------------------------------
 
 @command("USER")
 def cmd_user(session: "Session", args: str) -> tuple[int, str]:
@@ -94,22 +77,14 @@ def cmd_pass(session: "Session", args: str) -> tuple[int, str]:
     log.warning("FAILED LOGIN  user=%s addr=%s", session.username, session.addr)
     return 530, "Not logged in — wrong password"
 
-# ---------------------------------------------------------------------------
-# Session control commands
-# ---------------------------------------------------------------------------
 
 @command("QUIT")
 def cmd_quit(session: "Session", args: str) -> tuple[int, str]:
     return 221, "Goodbye"
 
-
 @command("NOOP")
 def cmd_noop(session: "Session", args: str) -> tuple[int, str]:
     return 200, "Command OK"
-
-# ---------------------------------------------------------------------------
-# Info/status commands
-# ---------------------------------------------------------------------------
 
 @command("PWD")
 def cmd_pwd(session: "Session", args: str) -> tuple[int, str]:
@@ -204,8 +179,8 @@ def cmd_dele(session: "Session", args: str) -> tuple[int, str]:
     filename = args.strip()
     if not filename:
         return 501, "Syntax error: filename required"
-    target = session.cwd / filename
-    if not target.is_file():
+    target = resolve_path(session, filename)
+    if target is None or not target.is_file():
         return 550, f"File unavailable: {filename}"
     try:
         target.unlink()
@@ -225,8 +200,8 @@ def cmd_rnfr(session: "Session", args: str) -> tuple[int, str]:
     filename = args.strip()
     if not filename:
         return 501, "Syntax error: filename required"
-    target = session.cwd / filename
-    if not target.exists():
+    target = resolve_path(session, filename)
+    if target is None or not target.exists():
         return 550, f"File unavailable: {filename}"
     session.rename_from = str(target)
     return 350, f"Ready for RNTO (rename \'{filename}\')"
@@ -244,7 +219,9 @@ def cmd_rnto(session: "Session", args: str) -> tuple[int, str]:
     if not newname:
         return 501, "Syntax error: new filename required"
     src = Path(session.rename_from)
-    dst = session.cwd / newname
+    dst = resolve_path(session, newname)
+    if dst is None:
+        return 550, "Invalid destination path"
     try:
         src.rename(dst)
         log.info("RNTO   %s -> %s  user=%s", src.name, newname, session.username)
@@ -254,11 +231,6 @@ def cmd_rnto(session: "Session", args: str) -> tuple[int, str]:
         log.error("RNTO   error  %s", exc)
         session.rename_from = ""
         return 451, f"Requested action aborted: {exc}"
-
-
-# ---------------------------------------------------------------------------
-# UDP Data Channel helpers (Basic Level — fixed ports, no reliability)
-# ---------------------------------------------------------------------------
 
 def _open_server_data_sock() -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -346,10 +318,6 @@ def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "
                 session.data_mode = "NONE"
     return total_bytes
 
-# ---------------------------------------------------------------------------
-# File transfer commands
-# ---------------------------------------------------------------------------
-
 @command("RETR")
 def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
     """
@@ -360,8 +328,8 @@ def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
     if err:
         return err
 
-    target = session.cwd / args.strip()
-    if not target.is_file():
+    target = resolve_path(session, args.strip())
+    if target is None or not target.is_file():
         return 550, f"File unavailable: {args}"
 
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
@@ -414,7 +382,9 @@ def cmd_stor(session: "Session", args: str) -> tuple[int, str]:
     if err:
         return err
 
-    target = session.cwd / args.strip()
+    target = resolve_path(session, args.strip())
+    if target is None:
+        return 550, "Invalid path"
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
 
     try:
@@ -509,6 +479,7 @@ def cmd_list(session: "Session", args: str) -> tuple[int, str]:
         lines.append(f"{kind} {st.st_size:>10} {entry.name}")
     
     data = "\r\n".join(lines).encode("utf-8")
+    session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
     _send_over_data_channel(session, data)
     return 226, "Directory listing complete"
 
@@ -524,6 +495,7 @@ def cmd_nlst(session: "Session", args: str) -> tuple[int, str]:
         return 550, "Directory unavailable"
 
     names = "\r\n".join(sorted(e.name for e in target.iterdir()))
+    session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
     _send_over_data_channel(session, names.encode("utf-8"))
     return 226, "Transfer complete"
 
@@ -537,7 +509,8 @@ def cmd_stou(session: "Session", args: str) -> tuple[int, str]:
     import uuid
     unique_name = f"{uuid.uuid4().hex[:8]}_{args.strip() or 'file'}"
     target = session.cwd / unique_name
-    
+
+    session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
     _recv_over_data_channel(session, target)
     return 226, f"Transfer complete, stored as {unique_name}"
 
@@ -552,13 +525,9 @@ def cmd_appe(session: "Session", args: str) -> tuple[int, str]:
     if target is None:
         return 550, "Invalid path"
 
+    session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
     _recv_over_data_channel(session, target, mode="ab")
     return 226, "Transfer complete"
-
-
-# ---------------------------------------------------------------------------
-# PORT and PASV commands
-# ---------------------------------------------------------------------------
 
 @command("PASV")
 def cmd_pasv(session: "Session", args: str) -> tuple[int, str]:

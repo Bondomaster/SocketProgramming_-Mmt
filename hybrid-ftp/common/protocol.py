@@ -9,10 +9,6 @@ All FTP commands and replies are plain text lines terminated by \\r\\n.
 import socket
 
 
-# ---------------------------------------------------------------------------
-# Reply/Command formatting
-# ---------------------------------------------------------------------------
-
 def format_reply(code: int, text: str) -> bytes:
     """Encode an FTP reply line, e.g.  220 Service ready\\r\\n"""
     return f"{code} {text}\r\n".encode("utf-8")
@@ -37,10 +33,6 @@ def parse_command(line: str) -> tuple[str, str]:
         cmd, args = line, ""
     return cmd.upper(), args
 
-
-# ---------------------------------------------------------------------------
-# TCP line reader (with manual buffer)
-# ---------------------------------------------------------------------------
 
 def read_line(sock: socket.socket, buf: bytearray) -> str | None:
     """
@@ -74,10 +66,6 @@ def read_line(sock: socket.socket, buf: bytearray) -> str | None:
     buf.extend(rest)
     return line.decode("utf-8", errors="replace")
 
-
-# ---------------------------------------------------------------------------
-# Reply reader for client-side (single blocking read, no persistent buffer)
-# ---------------------------------------------------------------------------
 
 def recv_reply(sock: socket.socket) -> str:
     """

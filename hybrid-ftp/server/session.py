@@ -14,26 +14,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import socket
 
-
-# ---------------------------------------------------------------------------
-# User credentials store (hardcoded for Basic Level demo)
-# ---------------------------------------------------------------------------
-
 USERS: dict[str, str] = {
     "admin": "1234",
     "alice": "secret",
     "guest": "guest",
 }
 
-
 def check_credentials(username: str, password: str) -> bool:
     """Return True if (username, password) is valid."""
     return USERS.get(username) == password
 
-
-# ---------------------------------------------------------------------------
-# Session dataclass
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Session:

@@ -12,19 +12,15 @@ UDP Data Channel:
 """
 
 from __future__ import annotations
-
 import re
 import socket
 from pathlib import Path
-
-from common.protocol import format_reply, recv_reply
+from common.protocol import recv_reply
 
 CHUNK_SIZE = 1024
+SERVER_DATA_PORT = 2122
 
-# ---------------------------------------------------------------------------
 # UDP helpers
-# ---------------------------------------------------------------------------
-
 def _send_file_udp(dest_addr: tuple[str, int], local_path: Path) -> int:
     """
     Upload *local_path* to the server via UDP (STOR helper).
@@ -95,6 +91,40 @@ def _recv_text_udp(server_addr: tuple[str, int], timeout: float = 5.0) -> str:
     
     return b"".join(chunks).decode("utf-8", errors="replace")
 
+def _recv_file_on_socket(sock: socket.socket, out_path: Path, timeout: float = 10.0) -> int:
+    """
+    Nhận file qua 1 socket UDP ĐÃ CÓ SẴN (đã bind từ trước, dùng cho Active Mode).
+    Khác _recv_file_udp: không cần gửi gói "HELLO" chọc lỗ, vì ở Active Mode
+    server đã biết địa chỉ client (từ lệnh PORT) và sẽ chủ động gửi dữ liệu tới.
+    """
+    sock.settimeout(timeout)
+    total = 0
+    with open(out_path, "wb") as f:
+        while True:
+            try:
+                chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
+            except socket.timeout:
+                print("[ERROR] Timeout waiting for data from server (Active mode)")
+                break
+            if not chunk:
+                break
+            f.write(chunk)
+            total += len(chunk)
+    return total
+
+def _recv_text_on_socket(sock: socket.socket, timeout: float = 5.0) -> str:
+    """Phiên bản Active Mode của _recv_text_udp — không cần punch-hole."""
+    sock.settimeout(timeout)
+    chunks = []
+    while True:
+        try:
+            chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 def parse_pasv_reply(reply: str) -> tuple[str, int] | None:
     match = re.search(r'\((\d+,\d+,\d+,\d+,\d+,\d+)\)', reply)
@@ -104,10 +134,6 @@ def parse_pasv_reply(reply: str) -> tuple[str, int] | None:
     ip = f"{parts[0]}.{parts[1]}.{parts[2]}.{parts[3]}"
     port = (parts[4] << 8) + parts[5]
     return ip, port
-
-# ---------------------------------------------------------------------------
-# Main client loop
-# ---------------------------------------------------------------------------
 
 def run_client(host: str, port: int) -> None:
     ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -121,6 +147,8 @@ def run_client(host: str, port: int) -> None:
     # Print server welcome banner
     banner = recv_reply(ctrl_sock)
     print(f"<<  {banner}")
+    transfer_mode = "PASV"
+    active_sock: socket.socket | None = None
 
     while True:
         try:
@@ -136,15 +164,52 @@ def run_client(host: str, port: int) -> None:
         cmd = parts[0].upper()
         args = parts[1] if len(parts) > 1 else ""
 
-        if cmd in ("STOR", "RETR", "LIST", "NLST"):
-            # 1. Issue PASV
-            ctrl_sock.sendall(b"PASV\r\n")
-            pasv_reply = recv_reply(ctrl_sock)
-            print(f"<<  {pasv_reply}")
-            pasv_addr = parse_pasv_reply(pasv_reply)
-            if not pasv_addr:
-                print("[ERROR] PASV failed, aborting command")
-                continue
+        if cmd == "PORT" and not args:
+            if active_sock is not None:
+                active_sock.close()
+            active_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            active_sock.bind(("0.0.0.0", 0))
+            client_port = active_sock.getsockname()[1]
+            client_ip = ctrl_sock.getsockname()[0]
+            ip_parts = client_ip.split(".")
+            p1, p2 = client_port >> 8, client_port & 0xFF
+            port_cmd = f"PORT {','.join(ip_parts)},{p1},{p2}"
+            ctrl_sock.sendall((port_cmd + "\r\n").encode())
+            reply = recv_reply(ctrl_sock)
+            print(f"[STATUS] {port_cmd}")
+            print(f"<<  {reply}")
+            if reply.startswith("200"):
+                transfer_mode = "ACTIVE"
+                print(f"[STATUS] Active Mode BẬT — client lắng nghe UDP tại "
+                      f"{client_ip}:{client_port}")
+            else:
+                active_sock.close()
+                active_sock = None
+                print("[ERROR] PORT command thất bại, giữ nguyên Passive Mode")
+            continue
+
+        if cmd == "PASV" and not args:
+            if active_sock is not None:
+                active_sock.close()
+                active_sock = None
+            transfer_mode = "PASV"
+            print("[STATUS] Passive Mode BẬT (mặc định, tự động PASV mỗi lần truyền)")
+            continue
+
+        if cmd in ("STOR", "RETR", "LIST", "NLST", "APPE", "STOU"):
+            if transfer_mode == "ACTIVE":
+                data_addr = (host, SERVER_DATA_PORT)   # nơi CLIENT sẽ GỬI (STOR)
+                recv_sock = active_sock                 # nơi CLIENT sẽ NHẬN (RETR/LIST/NLST)
+            else:
+                ctrl_sock.sendall(b"PASV\r\n")
+                pasv_reply = recv_reply(ctrl_sock)
+                print(f"<<  {pasv_reply}")
+                pasv_addr = parse_pasv_reply(pasv_reply)
+                if not pasv_addr:
+                    print("[ERROR] PASV failed, aborting command")
+                    continue
+                data_addr = pasv_addr
+                recv_sock = None
 
             if cmd == "STOR":
                 local_path = Path(args)
@@ -158,7 +223,7 @@ def run_client(host: str, port: int) -> None:
 
                 if initial_reply.startswith("150"):
                     print(f"[STATUS] Uploading '{local_path.name}' ({file_size} bytes) ...")
-                    bytes_sent = _send_file_udp(pasv_addr, local_path)
+                    bytes_sent = _send_file_udp(data_addr, local_path)
                     final_reply = recv_reply(ctrl_sock)
                     print(f"<<  {final_reply}")
                     
@@ -173,6 +238,30 @@ def run_client(host: str, port: int) -> None:
                         print(f"[STATUS] Upload complete — {bytes_sent} bytes sent")
                 else:
                     print("[ERROR] Upload aborted.")
+
+            elif cmd in ("APPE", "STOU"):
+                local_path = Path(args)
+                if not local_path.is_file():
+                    print(f"[ERROR] Local file not found: {local_path}")
+                    continue
+                file_size = local_path.stat().st_size
+                # STOU không cần tên file đích (server tự sinh tên duy nhất);
+                # APPE cần tên file đích để nối thêm dữ liệu vào cuối.
+                if cmd == "APPE":
+                    ctrl_sock.sendall(f"APPE {args}\r\n".encode())
+                else:
+                    ctrl_sock.sendall(f"STOU {local_path.name}\r\n".encode())
+                initial_reply = recv_reply(ctrl_sock)
+                print(f"<<  {initial_reply}")
+
+                if initial_reply.startswith("150"):
+                    print(f"[STATUS] Sending '{local_path.name}' ({file_size} bytes) via {cmd} ...")
+                    bytes_sent = _send_file_udp(data_addr, local_path)
+                    final_reply = recv_reply(ctrl_sock)
+                    print(f"<<  {final_reply}")
+                    print(f"[STATUS] {cmd} complete — {bytes_sent} bytes sent")
+                else:
+                    print(f"[ERROR] {cmd} aborted.")
             
             elif cmd == "RETR":
                 expected_size = -1
@@ -187,7 +276,10 @@ def run_client(host: str, port: int) -> None:
                 if initial_reply.startswith("150"):
                     out_path = Path(args).name
                     print(f"[STATUS] Downloading '{args}' → '{out_path}' ...")
-                    bytes_recv = _recv_file_udp(pasv_addr, Path(out_path))
+                    if transfer_mode == "ACTIVE":
+                        bytes_recv = _recv_file_on_socket(recv_sock, Path(out_path))
+                    else:
+                        bytes_recv = _recv_file_udp(data_addr, Path(out_path))
                     final_reply = recv_reply(ctrl_sock)
                     print(f"<<  {final_reply}")
                     
@@ -209,7 +301,10 @@ def run_client(host: str, port: int) -> None:
                 print(f"<<  {initial_reply}")
                 
                 if initial_reply.startswith("150") or initial_reply.startswith("125"):
-                    text = _recv_text_udp(pasv_addr)
+                    if transfer_mode == "ACTIVE":
+                        text = _recv_text_on_socket(recv_sock)
+                    else:
+                        text = _recv_text_udp(data_addr)
                     if text:
                         print(text, end="")
                         if not text.endswith('\n'):
