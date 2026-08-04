@@ -1,5 +1,5 @@
 from .rdt_packet import pack_packet, unpack_packet, FLAG_ACK, FLAG_FIN
-
+from rich.progress import Progress, TextColumn, BarColumn, DownloadColumn
 RECV_WINDOW = 64
 
 def recv_file(sock, out_path):
@@ -7,6 +7,13 @@ def recv_file(sock, out_path):
     expected = 0
     peer_addr = None
 
+    with Progress(
+        TextColumn("[bold green]Downloading..."),
+        BarColumn(),
+        DownloadColumn(),
+        transient=True
+    ) as progress:
+        task = progress.add_task("download", total=None)  # total=None for indeterminate progress
     with open(out_path, "wb") as out:
         while True:
             sock.settimeout(3.0) 
@@ -23,6 +30,7 @@ def recv_file(sock, out_path):
 
             if flags & FLAG_FIN:
                 _flush_in_order(buffer, out, expected)
+                progress.update(task, completed=expected)
                 ack = pack_packet(0, seq, FLAG_ACK, b"")
                 sock.sendto(ack, peer_addr)
                 break
@@ -31,7 +39,7 @@ def recv_file(sock, out_path):
                 buffer[seq] = payload    
 
             expected = _flush_in_order(buffer, out, expected)
-
+            progress.update(task, completed=expected)
             ack = pack_packet(0, seq, FLAG_ACK, b"")
             sock.sendto(ack, peer_addr)
 

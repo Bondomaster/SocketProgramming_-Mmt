@@ -2,6 +2,7 @@ import socket
 import time
 import random
 from .rdt_packet import pack_packet, unpack_packet, FLAG_FIN, FLAG_ACK
+from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 
 MSS = 1024        
 MAX_WINDOW = 64    
@@ -35,6 +36,15 @@ def send_file(sock, dest_addr, chunks, simulate_faults=None):
     
     retransmits = 0
     sock.setblocking(False) 
+    with Progress(
+        TextColumn("[bold blue]Uploading..."),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        transient=True # Thanh chạy sẽ tự biến mất khi xong cho gọn màn hình
+    ) as progress:
+        
+        task = progress.add_task("upload", total=N)
     def send_pkt(seq):
         pkt = pack_packet(seq, 0, 0, chunks[seq])
         if simulate_faults:
@@ -68,6 +78,7 @@ def send_file(sock, dest_addr, chunks, simulate_faults=None):
                         
                     while base < N and ack_received[base]:
                         base += 1
+                        progress.update(task, completed=base)
                         
         except BlockingIOError:
             pass 
