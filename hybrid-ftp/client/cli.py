@@ -16,55 +16,36 @@ import re
 import socket
 from pathlib import Path
 from common.protocol import recv_reply
+from common.rdt_sender import send_file
+from common.rdt_receiver import recv_file
+from common.hashutil import sha256_file
 
 CHUNK_SIZE = 1024
 SERVER_DATA_PORT = 2122
 
 # UDP helpers
 def _send_file_udp(dest_addr: tuple[str, int], local_path: Path) -> int:
-    """
-    Upload *local_path* to the server via UDP (STOR helper).
-    Chunks the file into CHUNK_SIZE datagrams, ends with empty datagram.
-    Returns total bytes sent.
-    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     total = 0
     try:
+        chunks = []
         with open(local_path, "rb") as f:
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                sock.sendto(chunk, dest_addr)
+            while chunk := f.read(CHUNK_SIZE):
+                chunks.append(chunk)
                 total += len(chunk)
-        sock.sendto(b"", dest_addr)   # EOF signal
+        send_file(sock, dest_addr, chunks)
     finally:
         sock.close()
     return total
 
-
 def _recv_file_udp(server_addr: tuple[str, int], out_path: Path, timeout: float = 10.0) -> int:
-    """
-    Download a file from the server via UDP (RETR helper).
-    Sends dummy datagram to punch hole for PASV, receives chunks until empty datagram.
-    Returns total bytes received.
-    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     total = 0
     try:
-        sock.sendto(b"HELLO", server_addr) # punch hole / inform server of port
-        with open(out_path, "wb") as f:
-            while True:
-                try:
-                    chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
-                except socket.timeout:
-                    print("[ERROR] Timeout waiting for data from server")
-                    break
-                if not chunk:   # empty datagram = EOF
-                    break
-                f.write(chunk)
-                total += len(chunk)
+        sock.sendto(b"HELLO", server_addr)
+        recv_file(sock, out_path)
+        total = out_path.stat().st_size
     finally:
         sock.close()
     return total
@@ -225,7 +206,17 @@ def run_client(host: str, port: int) -> None:
                     print(f"[STATUS] Uploading '{local_path.name}' ({file_size} bytes) ...")
                     bytes_sent = _send_file_udp(data_addr, local_path)
                     final_reply = recv_reply(ctrl_sock)
-                    print(f"<<  {final_reply}")
+                    print("[STATUS] Đang đối chiếu mã băm SHA-256 với Server...")
+                    local_hash = sha256_file(local_path)
+                    ctrl_sock.sendall(f"HASH {local_path.name}\r\n".encode())
+                    hash_reply = recv_reply(ctrl_sock)
+                    print(f"<<  {hash_reply}")
+                    if hash_reply.startswith("213"):
+                        server_hash = hash_reply.split()[-1]
+                        if local_hash == server_hash:
+                            print(f"[VERIFIED]: SHA-256 khớp tuyệt đối! ({local_hash[:8]}...)")
+                        else:
+                            print(f"[ERROR]: Dữ liệu hỏng!\nClient: {local_hash}\nServer: {server_hash}")
                     
                     match = re.search(r'\((\d+)\s+bytes\)', final_reply)
                     if match:
@@ -272,7 +263,18 @@ def run_client(host: str, port: int) -> None:
 
                 ctrl_sock.sendall(f"RETR {args}\r\n".encode())
                 initial_reply = recv_reply(ctrl_sock)
-                print(f"<<  {initial_reply}")
+                if bytes_recv > 0:
+                        print("[STATUS] Đang đối chiếu mã băm SHA-256 với Server...")
+                        local_hash = sha256_file(Path(out_path))
+                        ctrl_sock.sendall(f"HASH {args}\r\n".encode())
+                        hash_reply = recv_reply(ctrl_sock)
+                        print(f"<<  {hash_reply}")
+                        if hash_reply.startswith("213"):
+                            server_hash = hash_reply.split()[-1]
+                            if local_hash == server_hash:
+                                print(f"[VERIFIED]: SHA-256 khớp tuyệt đối! ({local_hash[:8]}...)")
+                            else:
+                                print(f"[ERROR]: Dữ liệu hỏng!\nClient: {local_hash}\nServer: {server_hash}")
                 if initial_reply.startswith("150"):
                     out_path = Path(args).name
                     print(f"[STATUS] Downloading '{args}' → '{out_path}' ...")

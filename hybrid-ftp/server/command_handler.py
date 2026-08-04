@@ -26,7 +26,9 @@ from typing import Callable, TYPE_CHECKING
 if TYPE_CHECKING:
     from .session import Session
 from .session import check_credentials, resolve_path
-
+from common.rdt_sender import send_file
+from common.rdt_receiver import recv_file
+from common.hashutil import sha256_file
 log = logging.getLogger("ftp-server")
 
 
@@ -107,34 +109,32 @@ def cmd_type(session: "Session", args: str) -> tuple[int, str]:
 @command("STAT")
 def cmd_stat(session: "Session", args: str) -> tuple[int, str]:
     if args:
-        target = session.cwd / args.strip()
-        if not target.exists():
-            return 450, "File unavailable"
+        target = resolve_path(session, args.strip())
+        if target is None or not target.exists():
+            return 550, "File unavailable" 
         return 213, f"{target.name} {target.stat().st_size} bytes"
     return 211, (
         f"FTP server status — connected as {session.username or 'anonymous'}, "
         f"cwd={session.cwd}, type={session.type_}"
     )
 
-
 @command("SIZE")
 def cmd_size(session: "Session", args: str) -> tuple[int, str]:
     err = _require_auth(session)
     if err:
         return err
-    target = session.cwd / args.strip()
-    if not target.is_file():
+    target = resolve_path(session, args.strip())
+    if target is None or not target.is_file():
         return 550, "File unavailable"
     return 213, str(target.stat().st_size)
-
 
 @command("MDTM")
 def cmd_mdtm(session: "Session", args: str) -> tuple[int, str]:
     err = _require_auth(session)
     if err:
         return err
-    target = session.cwd / args.strip()
-    if not target.is_file():
+    target = resolve_path(session, args.strip())
+    if target is None or not target.is_file():
         return 550, "File unavailable"
     ts = datetime.datetime.fromtimestamp(target.stat().st_mtime)
     return 213, ts.strftime("%Y%m%d%H%M%S")
@@ -298,16 +298,8 @@ def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "
     if sock:
         sock.settimeout(10.0)
         try:
-            with open(target_path, mode) as f:
-                while True:
-                    try:
-                        chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
-                    except socket.timeout:
-                        break
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    total_bytes += len(chunk)
+            recv_file(sock, target_path)
+            total_bytes = target_path.stat().st_size
         finally:
             if session.pasv_sock:
                 session.pasv_sock.close()
@@ -348,15 +340,12 @@ def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
 
         if peer:
             log.info("RETR   %s → %s:%d", target.name, *peer)
+            chunks = []
             with open(target, "rb") as f:
-                while True:
-                    chunk = f.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    sock.sendto(chunk, peer)
+                while chunk := f.read(CHUNK_SIZE):
+                    chunks.append(chunk)
                     total_bytes += len(chunk)
-            # Signal EOF with an empty datagram
-            sock.sendto(b"", peer)
+            send_file(sock, peer, chunks)
             log.info("RETR   complete  file=%s  bytes=%d", target.name, total_bytes)
         return 226, f"Transfer complete ({total_bytes} bytes)"
     except OSError as exc:
@@ -578,3 +567,17 @@ def cmd_port(session: "Session", args: str) -> tuple[int, str]:
         return 200, "PORT command successful"
     except Exception:
         return 501, "Syntax error in parameters"
+
+@command("HASH")
+def cmd_hash(session: "Session", args: str) -> tuple[int, str]:
+    err = _require_auth(session)
+    if err:
+        return err
+    filename = args.strip()
+    if not filename:
+        return 501, "Syntax error: filename required"
+    target = resolve_path(session, filename)
+    if target is None or not target.is_file():
+        return 550, f"File unavailable: {filename}"
+    digest = sha256_file(target)
+    return 213, f"SHA-256 {digest}"

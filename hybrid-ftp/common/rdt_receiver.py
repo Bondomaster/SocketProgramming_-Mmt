@@ -1,6 +1,6 @@
 from .rdt_packet import pack_packet, unpack_packet, FLAG_ACK, FLAG_FIN
 
-RECV_WINDOW = 8
+RECV_WINDOW = 64
 
 def recv_file(sock, out_path):
     buffer: dict[int, bytes] = {}
