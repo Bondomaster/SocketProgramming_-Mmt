@@ -16,7 +16,7 @@ import re
 import socket
 from pathlib import Path
 from common.protocol import recv_reply
-from common.rdt_sender import send_file
+from common.rdt_sender import send_file, make_fault_injector
 from common.rdt_receiver import recv_file
 from common.hashutil import sha256_file
 from rich.console import Console
@@ -26,7 +26,7 @@ CHUNK_SIZE = 1024
 SERVER_DATA_PORT = 2122
 
 # UDP helpers
-def _send_file_udp(dest_addr: tuple[str, int], local_path: Path) -> int:
+def _send_file_udp(dest_addr: tuple[str, int], local_path: Path, simulate_faults=None) -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     total = 0
     try:
@@ -35,7 +35,7 @@ def _send_file_udp(dest_addr: tuple[str, int], local_path: Path) -> int:
             while chunk := f.read(CHUNK_SIZE):
                 chunks.append(chunk)
                 total += len(chunk)
-        send_file(sock, dest_addr, chunks)
+        send_file(sock, dest_addr, chunks, simulate_faults=simulate_faults)
     finally:
         sock.close()
     return total
@@ -54,55 +54,49 @@ def _recv_file_udp(server_addr: tuple[str, int], out_path: Path, timeout: float 
 
 def _recv_text_udp(server_addr: tuple[str, int], timeout: float = 5.0) -> str:
     """
-    Receive text data (for LIST / NLST) from Server via UDP.
+    Receive text data (for LIST / NLST) from Server via UDP using RDT.
     """
+    import tempfile
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
-    chunks = []
     try:
         sock.sendto(b"HELLO", server_addr) # punch hole
-        while True:
-            try:
-                chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
-            except socket.timeout:
-                break
-            if not chunk:   # Empty datagram = EOF
-                break
-            chunks.append(chunk)
+        tmp_path = Path(tempfile.mktemp())
+        recv_file(sock, tmp_path)
+        if tmp_path.exists():
+            text = tmp_path.read_text(encoding="utf-8", errors="replace")
+            tmp_path.unlink()
+            return text
+        return ""
     finally:
         sock.close()
-    
-    return b"".join(chunks).decode("utf-8", errors="replace")
 
 def _recv_file_on_socket(sock: socket.socket, out_path: Path, timeout: float = 10.0) -> int:
     sock.settimeout(timeout)
     total = 0
-    with open(out_path, "wb") as f:
-        while True:
-            try:
-                chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
-            except socket.timeout:
-                console.print("[ERROR] Timeout waiting for data from server (Active mode)")
-                break
-            if not chunk:
-                break
-            f.write(chunk)
-            total += len(chunk)
+    try:
+        recv_file(sock, out_path)
+        if out_path.exists():
+            total = out_path.stat().st_size
+    except Exception as e:
+        console.print(f"[ERROR] Active mode download error: {e}")
     return total
 
 def _recv_text_on_socket(sock: socket.socket, timeout: float = 5.0) -> str:
     """Phiên bản Active Mode của _recv_text_udp — không cần punch-hole."""
+    import tempfile
     sock.settimeout(timeout)
-    chunks = []
-    while True:
-        try:
-            chunk, _ = sock.recvfrom(CHUNK_SIZE + 64)
-        except socket.timeout:
-            break
-        if not chunk:
-            break
-        chunks.append(chunk)
-    return b"".join(chunks).decode("utf-8", errors="replace")
+    try:
+        tmp_path = Path(tempfile.mktemp())
+        recv_file(sock, tmp_path)
+        if tmp_path.exists():
+            text = tmp_path.read_text(encoding="utf-8", errors="replace")
+            tmp_path.unlink()
+            return text
+        return ""
+    except Exception as e:
+        console.print(f"[ERROR] _recv_text_on_socket error: {e}")
+        return ""
 
 def parse_pasv_reply(reply: str) -> tuple[str, int] | None:
     match = re.search(r'\((\d+,\d+,\d+,\d+,\d+,\d+)\)', reply)
@@ -113,7 +107,7 @@ def parse_pasv_reply(reply: str) -> tuple[str, int] | None:
     port = (parts[4] << 8) + parts[5]
     return ip, port
 
-def run_client(host: str, port: int) -> None:
+def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float = 0.0) -> None:
     ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         ctrl_sock.connect((host, port))
@@ -127,6 +121,11 @@ def run_client(host: str, port: int) -> None:
     console.print(f"<<  {banner}")
     transfer_mode = "PASV"
     active_sock: socket.socket | None = None
+    
+    fault_injector = None
+    if drop_rate > 0 or corrupt_rate > 0:
+        fault_injector = make_fault_injector(drop_rate, corrupt_rate)
+        console.print(f"[STATUS] Fault Injector ACTIVE (Drop: {drop_rate}, Corrupt: {corrupt_rate})")
 
     while True:
         try:
@@ -201,7 +200,7 @@ def run_client(host: str, port: int) -> None:
 
                 if initial_reply.startswith("150"):
                     console.print(f"[STATUS] Uploading '{local_path.name}' ({file_size} bytes) ...")
-                    bytes_sent = _send_file_udp(data_addr, local_path)
+                    bytes_sent = _send_file_udp(data_addr, local_path, simulate_faults=fault_injector)
                     final_reply = recv_reply(ctrl_sock)
                     console.print("[STATUS] Đang đối chiếu mã băm SHA-256 với Server...")
                     local_hash = sha256_file(local_path)
@@ -244,7 +243,7 @@ def run_client(host: str, port: int) -> None:
 
                 if initial_reply.startswith("150"):
                     console.print(f"[STATUS] Sending '{local_path.name}' ({file_size} bytes) via {cmd} ...")
-                    bytes_sent = _send_file_udp(data_addr, local_path)
+                    bytes_sent = _send_file_udp(data_addr, local_path, simulate_faults=fault_injector)
                     final_reply = recv_reply(ctrl_sock)
                     console.print(f"<<  {final_reply}")
                     console.print(f"[STATUS] {cmd} complete — {bytes_sent} bytes sent")

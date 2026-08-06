@@ -155,7 +155,8 @@ def cmd_syst(session: "Session", args: str) -> tuple[int, str]:
 
 @command("ABOR")
 def cmd_abor(session: "Session", args: str) -> tuple[int, str]:
-    """Abort the current data transfer (Basic Level: simple acknowledgement stub)."""
+    """Abort the current data transfer.
+    Note: Returns 226 as a stub. A true abort would require running the transfer on a separate thread with a cancel flag."""
     return 226, "ABOR command successful"
 
 
@@ -203,7 +204,7 @@ def cmd_rnfr(session: "Session", args: str) -> tuple[int, str]:
     target = resolve_path(session, filename)
     if target is None or not target.exists():
         return 550, f"File unavailable: {filename}"
-    session.rename_from = str(target)
+    session.rename_from = target
     return 350, f"Ready for RNTO (rename \'{filename}\')"
 
 
@@ -218,18 +219,18 @@ def cmd_rnto(session: "Session", args: str) -> tuple[int, str]:
     newname = args.strip()
     if not newname:
         return 501, "Syntax error: new filename required"
-    src = Path(session.rename_from)
+    src = session.rename_from
     dst = resolve_path(session, newname)
     if dst is None:
         return 550, "Invalid destination path"
     try:
         src.rename(dst)
         log.info("RNTO   %s -> %s  user=%s", src.name, newname, session.username)
-        session.rename_from = ""   # clear after successful rename
+        session.rename_from = None   # clear after successful rename
         return 250, f"Rename successful: {src.name} -> {newname}"
     except OSError as exc:
         log.error("RNTO   error  %s", exc)
-        session.rename_from = ""
+        session.rename_from = None
         return 451, f"Requested action aborted: {exc}"
 
 def _open_server_data_sock() -> socket.socket:
@@ -245,19 +246,20 @@ def _open_client_data_sock(client_ip: str) -> tuple[socket.socket, tuple[str, in
     client_addr = (client_ip, CLIENT_DATA_PORT)
     return sock, client_addr
 
-def _get_data_socket_and_peer(session: "Session") -> tuple[socket.socket, tuple[str, int] | None, bool]:
+def _get_data_socket_and_peer(session: "Session") -> tuple[socket.socket | None, tuple[str, int] | None, bool]:
     if session.data_mode == "PASSIVE" and session.pasv_sock:
         return session.pasv_sock, None, True
     elif session.data_mode == "ACTIVE" and session.data_peer:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         return sock, session.data_peer, False
     else:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        return sock, (session.addr[0], CLIENT_DATA_PORT), False
+        return None, None, False
 
 
 def _send_over_data_channel(session: "Session", data: bytes) -> None:
     sock, peer, is_pasv = _get_data_socket_and_peer(session)
+    if not sock:
+        return
     try:
         if is_pasv and sock:
             sock.settimeout(5.0)  
@@ -268,10 +270,8 @@ def _send_over_data_channel(session: "Session", data: bytes) -> None:
                 return
 
         if peer:
-            for i in range(0, len(data), CHUNK_SIZE):
-                chunk = data[i:i + CHUNK_SIZE]
-                sock.sendto(chunk, peer)
-            sock.sendto(b"", peer)  
+            chunks = [data[i:i + CHUNK_SIZE] for i in range(0, max(1, len(data)), CHUNK_SIZE)]
+            send_file(sock, peer, chunks)
     except Exception as exc:
         log.error("Error sending data over UDP channel: %s", exc)
     finally:
@@ -324,11 +324,13 @@ def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
     if target is None or not target.is_file():
         return 550, f"File unavailable: {args}"
 
-    session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
-
     try:
         total_bytes = 0
         sock, peer, is_pasv = _get_data_socket_and_peer(session)
+        if not sock:
+            return 425, "Use PORT or PASV first"
+        
+        session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
         
         if is_pasv and sock:
             sock.settimeout(5.0)  
@@ -374,6 +376,11 @@ def cmd_stor(session: "Session", args: str) -> tuple[int, str]:
     target = resolve_path(session, args.strip())
     if target is None:
         return 550, "Invalid path"
+        
+    sock, _, _ = _get_data_socket_and_peer(session)
+    if not sock:
+        return 425, "Use PORT or PASV first"
+        
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
 
     try:
@@ -460,6 +467,10 @@ def cmd_list(session: "Session", args: str) -> tuple[int, str]:
     target = resolve_path(session, args.strip()) if args.strip() else session.cwd
     if target is None or not target.is_dir():
         return 550, "Directory unavailable"
+        
+    sock, _, _ = _get_data_socket_and_peer(session)
+    if not sock:
+        return 425, "Use PORT or PASV first"
 
     lines = []
     for entry in sorted(target.iterdir()):
@@ -482,6 +493,10 @@ def cmd_nlst(session: "Session", args: str) -> tuple[int, str]:
     target = resolve_path(session, args.strip()) if args.strip() else session.cwd
     if target is None or not target.is_dir():
         return 550, "Directory unavailable"
+        
+    sock, _, _ = _get_data_socket_and_peer(session)
+    if not sock:
+        return 425, "Use PORT or PASV first"
 
     names = "\r\n".join(sorted(e.name for e in target.iterdir()))
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
@@ -498,6 +513,10 @@ def cmd_stou(session: "Session", args: str) -> tuple[int, str]:
     import uuid
     unique_name = f"{uuid.uuid4().hex[:8]}_{args.strip() or 'file'}"
     target = session.cwd / unique_name
+    
+    sock, _, _ = _get_data_socket_and_peer(session)
+    if not sock:
+        return 425, "Use PORT or PASV first"
 
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
     _recv_over_data_channel(session, target)
@@ -513,6 +532,10 @@ def cmd_appe(session: "Session", args: str) -> tuple[int, str]:
     target = resolve_path(session, args.strip())
     if target is None:
         return 550, "Invalid path"
+        
+    sock, _, _ = _get_data_socket_and_peer(session)
+    if not sock:
+        return 425, "Use PORT or PASV first"
 
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
     _recv_over_data_channel(session, target, mode="ab")
