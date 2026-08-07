@@ -29,19 +29,24 @@ def recv_file(sock, out_path):
                     continue   
 
                 if flags & FLAG_FIN:
-                    _flush_in_order(buffer, out, expected)
+                    expected = _flush_in_order(buffer, out, expected)
                     progress.update(task, completed=expected)
                     ack = pack_packet(0, seq, FLAG_ACK, b"")
                     sock.sendto(ack, peer_addr)
                     break
 
-                if expected <= seq < expected + RECV_WINDOW:
-                    buffer[seq] = payload    
+                if seq < expected:
+                    ack = pack_packet(0, seq, FLAG_ACK, b"")
+                    sock.sendto(ack, peer_addr)
+                    continue
 
-                expected = _flush_in_order(buffer, out, expected)
-                progress.update(task, completed=expected)
-                ack = pack_packet(0, seq, FLAG_ACK, b"")
-                sock.sendto(ack, peer_addr)
+                elif expected <= seq < expected + RECV_WINDOW:
+                    buffer[seq] = payload    
+                    expected = _flush_in_order(buffer, out, expected)
+                    ack = pack_packet(0, seq, FLAG_ACK, b"")
+                    sock.sendto(ack, peer_addr)
+
+                else: pass
 
 def _flush_in_order(buffer, out, expected):
     while expected in buffer:
