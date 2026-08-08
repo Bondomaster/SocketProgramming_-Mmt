@@ -19,7 +19,6 @@ from pathlib import Path
 from common.protocol import recv_reply
 from common.rdt_sender import send_file, make_fault_injector
 from common.rdt_receiver import recv_file
-from common.hashutil import sha256_file
 from rich.console import Console
 
 console = Console()
@@ -230,18 +229,7 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
                         continue
                     final_reply = recv_reply(ctrl_sock)
                     console.print(f"<<  {final_reply}")
-                    console.print("[STATUS] Đang đối chiếu mã băm SHA-256 với Server...")
-                    local_hash = sha256_file(local_path)
-                    ctrl_sock.sendall(f"HASH {local_path.name}\r\n".encode())
-                    hash_reply = recv_reply(ctrl_sock)
-                    console.print(f"<<  {hash_reply}")
-                    if hash_reply.startswith("213"):
-                        server_hash = hash_reply.split()[-1]
-                        if local_hash == server_hash:
-                            console.print(f"[VERIFIED]: SHA-256 khớp tuyệt đối! ({local_hash[:8]}...)")
-                        else:
-                            console.print(f"[ERROR]: Dữ liệu hỏng!\nClient: {local_hash}\nServer: {server_hash}")
-                    
+
                     match = re.search(r'\((\d+)\s+bytes\)', final_reply)
                     if match:
                         server_bytes = int(match.group(1))
@@ -306,20 +294,7 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
                     if not success:
                         console.print("[ERROR] Download incomplete — no FIN received (connection may have dropped)")
                     elif bytes_recv > 0:
-                        console.print("[STATUS] Comparing SHA-256 hash with the server...")
-                        try:
-                            local_hash = sha256_file(Path(out_path))
-                            ctrl_sock.sendall(f"HASH {args}\r\n".encode())
-                            hash_reply = recv_reply(ctrl_sock)
-                            console.print(f"<<  {hash_reply}")
-                            if hash_reply.startswith("213"):
-                                server_hash = hash_reply.split()[-1]
-                                if local_hash == server_hash:
-                                    console.print(f"[VERIFIED]: SHA-256 matches perfectly! ({local_hash[:8]}...)")
-                                else:
-                                    console.print(f"[ERROR]: Data is corrupted!\nClient: {local_hash}\nServer: {server_hash}")
-                        except Exception as e:
-                            console.print(f"[ERROR] Cannot verify Hash: {e}")
+                        console.print(f"[STATUS] Download complete — {bytes_recv} bytes received → {out_path}")
                     else:
                         console.print("[ERROR] No data received (check server logs)")
                 else:
