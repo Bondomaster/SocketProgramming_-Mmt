@@ -284,22 +284,27 @@ def _send_over_data_channel(session: "Session", data: bytes) -> None:
             session.data_mode = "NONE"
 
 
-def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "wb") -> int:
+def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "wb") -> tuple[int, bool]:
+    """Receive a file over the active/passive UDP data channel using Stop-and-Wait RDT.
+
+    Returns (bytes_received, success) where success=True only if recv_file() saw a FIN.
+    """
     sock, _, is_pasv = _get_data_socket_and_peer(session)
-    
+
     if not is_pasv and session.data_mode != "PASSIVE" and sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind(("0.0.0.0", DATA_PORT))
         except OSError:
             pass
-        
+
     total_bytes = 0
+    success = False
     if sock:
-        sock.settimeout(10.0)
         try:
-            recv_file(sock, target_path)
-            total_bytes = target_path.stat().st_size
+            success = recv_file(sock, target_path)
+            if target_path.exists():
+                total_bytes = target_path.stat().st_size
         finally:
             if session.pasv_sock:
                 session.pasv_sock.close()
@@ -308,7 +313,7 @@ def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "
             else:
                 sock.close()
                 session.data_mode = "NONE"
-    return total_bytes
+    return total_bytes, success
 
 @command("RETR")
 def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
@@ -329,11 +334,11 @@ def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
         sock, peer, is_pasv = _get_data_socket_and_peer(session)
         if not sock:
             return 425, "Use PORT or PASV first"
-        
+
         session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
-        
+
         if is_pasv and sock:
-            sock.settimeout(5.0)  
+            sock.settimeout(5.0)
             try:
                 _, peer = sock.recvfrom(1024)
             except (socket.timeout, OSError):
@@ -347,8 +352,13 @@ def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
                 while chunk := f.read(CHUNK_SIZE):
                     chunks.append(chunk)
                     total_bytes += len(chunk)
-            send_file(sock, peer, chunks)
-            log.info("RETR   complete  file=%s  bytes=%d", target.name, total_bytes)
+            try:
+                retransmits = send_file(sock, peer, chunks)
+                log.info("RETR   complete  file=%s  bytes=%d  retransmits=%d",
+                         target.name, total_bytes, retransmits)
+            except ConnectionError as exc:
+                log.error("RETR   aborted  %s", exc)
+                return 426, "Connection closed; transfer aborted"
         return 226, f"Transfer complete ({total_bytes} bytes)"
     except OSError as exc:
         log.error("RETR   error  %s", exc)
@@ -366,8 +376,8 @@ def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
 @command("STOR")
 def cmd_stor(session: "Session", args: str) -> tuple[int, str]:
     """
-    Upload a file: server opens a fixed UDP port and waits for data from client.
-    Transfer ends when the client sends an empty datagram.
+    Upload a file: server receives data from client via Stop-and-Wait RDT.
+    Transfer is confirmed complete only when a valid FIN is received.
     """
     err = _require_auth(session)
     if err:
@@ -376,16 +386,20 @@ def cmd_stor(session: "Session", args: str) -> tuple[int, str]:
     target = resolve_path(session, args.strip())
     if target is None:
         return 550, "Invalid path"
-        
+
     sock, _, _ = _get_data_socket_and_peer(session)
     if not sock:
         return 425, "Use PORT or PASV first"
-        
+
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
 
     try:
         log.info("STOR   waiting on data channel  file=%s", target.name)
-        total_bytes = _recv_over_data_channel(session, target, mode="wb")
+        total_bytes, success = _recv_over_data_channel(session, target, mode="wb")
+        if not success:
+            log.warning("STOR   aborted (no FIN)  file=%s", target.name)
+            target.unlink(missing_ok=True)  # remove partial/corrupt file
+            return 426, "Connection closed; transfer aborted"
         log.info("STOR   complete  file=%s  bytes=%d", target.name, total_bytes)
         return 226, f"Transfer complete ({total_bytes} bytes)"
     except OSError as exc:
@@ -513,13 +527,16 @@ def cmd_stou(session: "Session", args: str) -> tuple[int, str]:
     import uuid
     unique_name = f"{uuid.uuid4().hex[:8]}_{args.strip() or 'file'}"
     target = session.cwd / unique_name
-    
+
     sock, _, _ = _get_data_socket_and_peer(session)
     if not sock:
         return 425, "Use PORT or PASV first"
 
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
-    _recv_over_data_channel(session, target)
+    _, success = _recv_over_data_channel(session, target)
+    if not success:
+        target.unlink(missing_ok=True)
+        return 426, "Connection closed; transfer aborted"
     return 226, f"Transfer complete, stored as {unique_name}"
 
 
@@ -532,13 +549,15 @@ def cmd_appe(session: "Session", args: str) -> tuple[int, str]:
     target = resolve_path(session, args.strip())
     if target is None:
         return 550, "Invalid path"
-        
+
     sock, _, _ = _get_data_socket_and_peer(session)
     if not sock:
         return 425, "Use PORT or PASV first"
 
     session.ctrl_sock.sendall(b"150 Opening UDP Data Channel\r\n")
-    _recv_over_data_channel(session, target, mode="ab")
+    _, success = _recv_over_data_channel(session, target, mode="ab")
+    if not success:
+        return 426, "Connection closed; transfer aborted"
     return 226, "Transfer complete"
 
 @command("PASV")

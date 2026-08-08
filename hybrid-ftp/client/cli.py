@@ -1,14 +1,15 @@
 """
 client/cli.py
 =============
-Interactive CLI for the Advanced Level Hybrid FTP client.
+Interactive CLI for the Excellent Level Hybrid FTP client.
 
 Handles the command-read-print loop and the special logic for file transfer
 commands (STOR/RETR/LIST/NLST) that require a parallel UDP data channel.
 
-UDP Data Channel:
-  - Uses PASV mode to get an ephemeral UDP port from the server to ensure concurrency.
-  - Checks expected sizes for RETR/STOR to catch silent UDP corruption/loss.
+UDP Data Channel (Stop-and-Wait RDT):
+  - Uses PASV mode to get an ephemeral UDP port from the server.
+  - send_file: Stop-and-Wait with ACK/retransmit — may raise ConnectionError.
+  - recv_file: returns True (FIN received) or False (timeout/dead connection).
 """
 
 from __future__ import annotations
@@ -25,8 +26,16 @@ console = Console()
 CHUNK_SIZE = 1024
 SERVER_DATA_PORT = 2122
 
-# UDP helpers
+# ---------------------------------------------------------------------------
+# UDP helpers (updated for Stop-and-Wait API)
+# ---------------------------------------------------------------------------
+
 def _send_file_udp(dest_addr: tuple[str, int], local_path: Path, simulate_faults=None) -> int:
+    """Send a local file via UDP using Stop-and-Wait RDT.
+
+    Returns the number of bytes sent.
+    Raises ConnectionError if the transfer fails after MAX_RETRIES.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     total = 0
     try:
@@ -40,58 +49,71 @@ def _send_file_udp(dest_addr: tuple[str, int], local_path: Path, simulate_faults
         sock.close()
     return total
 
-def _recv_file_udp(server_addr: tuple[str, int], out_path: Path, timeout: float = 10.0) -> int:
+def _recv_file_udp(server_addr: tuple[str, int], out_path: Path, timeout: float = 10.0) -> tuple[int, bool]:
+    """Receive a file via UDP using Stop-and-Wait RDT (Passive Mode).
+
+    Returns (bytes_received, success) where success=True only if FIN was received.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     total = 0
+    success = False
     try:
-        sock.sendto(b"HELLO", server_addr)
-        recv_file(sock, out_path)
-        total = out_path.stat().st_size
+        sock.sendto(b"HELLO", server_addr)  # punch hole for PASV
+        success = recv_file(sock, out_path)
+        if out_path.exists():
+            total = out_path.stat().st_size
     finally:
         sock.close()
-    return total
+    return total, success
 
 def _recv_text_udp(server_addr: tuple[str, int], timeout: float = 5.0) -> str:
-    """
-    Receive text data (for LIST / NLST) from Server via UDP using RDT.
-    """
+    """Receive text data (for LIST / NLST) from Server via UDP using Stop-and-Wait RDT."""
     import tempfile
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     try:
         sock.sendto(b"HELLO", server_addr) # punch hole
         tmp_path = Path(tempfile.mktemp())
-        recv_file(sock, tmp_path)
+        success = recv_file(sock, tmp_path)
         if tmp_path.exists():
             text = tmp_path.read_text(encoding="utf-8", errors="replace")
             tmp_path.unlink()
+            if not success:
+                console.print("[WARNING] LIST/NLST data may be incomplete (no FIN received)")
             return text
         return ""
     finally:
         sock.close()
 
-def _recv_file_on_socket(sock: socket.socket, out_path: Path, timeout: float = 10.0) -> int:
+def _recv_file_on_socket(sock: socket.socket, out_path: Path, timeout: float = 10.0) -> tuple[int, bool]:
+    """Receive a file via Active Mode UDP socket using Stop-and-Wait RDT.
+
+    Returns (bytes_received, success).
+    """
     sock.settimeout(timeout)
     total = 0
+    success = False
     try:
-        recv_file(sock, out_path)
+        success = recv_file(sock, out_path)
         if out_path.exists():
             total = out_path.stat().st_size
     except Exception as e:
         console.print(f"[ERROR] Active mode download error: {e}")
-    return total
+    return total, success
 
 def _recv_text_on_socket(sock: socket.socket, timeout: float = 5.0) -> str:
-    """Phiên bản Active Mode của _recv_text_udp — không cần punch-hole."""
+    """Active Mode version of _recv_text_udp — no punch-hole needed."""
     import tempfile
     sock.settimeout(timeout)
     try:
         tmp_path = Path(tempfile.mktemp())
-        recv_file(sock, tmp_path)
+        success = recv_file(sock, tmp_path)
         if tmp_path.exists():
             text = tmp_path.read_text(encoding="utf-8", errors="replace")
             tmp_path.unlink()
+            if not success:
+                console.print("[WARNING] LIST/NLST data may be incomplete (no FIN received)")
             return text
         return ""
     except Exception as e:
@@ -116,7 +138,6 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
         return
 
     console.print(f"[STATUS] Connected to {host}:{port}")
-    # console.print server welcome banner
     banner = recv_reply(ctrl_sock)
     console.print(f"<<  {banner}")
     transfer_mode = "PASV"
@@ -175,8 +196,8 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
 
         if cmd in ("STOR", "RETR", "LIST", "NLST", "APPE", "STOU"):
             if transfer_mode == "ACTIVE":
-                data_addr = (host, SERVER_DATA_PORT)   # nơi CLIENT sẽ GỬI (STOR)
-                recv_sock = active_sock                 # nơi CLIENT sẽ NHẬN (RETR/LIST/NLST)
+                data_addr = (host, SERVER_DATA_PORT)
+                recv_sock = active_sock
             else:
                 ctrl_sock.sendall(b"PASV\r\n")
                 pasv_reply = recv_reply(ctrl_sock)
@@ -200,8 +221,15 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
 
                 if initial_reply.startswith("150"):
                     console.print(f"[STATUS] Uploading '{local_path.name}' ({file_size} bytes) ...")
-                    bytes_sent = _send_file_udp(data_addr, local_path, simulate_faults=fault_injector)
+                    try:
+                        bytes_sent = _send_file_udp(data_addr, local_path, simulate_faults=fault_injector)
+                    except ConnectionError as exc:
+                        console.print(f"[ERROR] Upload failed: {exc}")
+                        final_reply = recv_reply(ctrl_sock)
+                        console.print(f"<<  {final_reply}")
+                        continue
                     final_reply = recv_reply(ctrl_sock)
+                    console.print(f"<<  {final_reply}")
                     console.print("[STATUS] Đang đối chiếu mã băm SHA-256 với Server...")
                     local_hash = sha256_file(local_path)
                     ctrl_sock.sendall(f"HASH {local_path.name}\r\n".encode())
@@ -232,8 +260,6 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
                     console.print(f"[ERROR] Local file not found: {local_path}")
                     continue
                 file_size = local_path.stat().st_size
-                # STOU không cần tên file đích (server tự sinh tên duy nhất);
-                # APPE cần tên file đích để nối thêm dữ liệu vào cuối.
                 if cmd == "APPE":
                     ctrl_sock.sendall(f"APPE {args}\r\n".encode())
                 else:
@@ -243,7 +269,13 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
 
                 if initial_reply.startswith("150"):
                     console.print(f"[STATUS] Sending '{local_path.name}' ({file_size} bytes) via {cmd} ...")
-                    bytes_sent = _send_file_udp(data_addr, local_path, simulate_faults=fault_injector)
+                    try:
+                        bytes_sent = _send_file_udp(data_addr, local_path, simulate_faults=fault_injector)
+                    except ConnectionError as exc:
+                        console.print(f"[ERROR] {cmd} failed: {exc}")
+                        final_reply = recv_reply(ctrl_sock)
+                        console.print(f"<<  {final_reply}")
+                        continue
                     final_reply = recv_reply(ctrl_sock)
                     console.print(f"<<  {final_reply}")
                     console.print(f"[STATUS] {cmd} complete — {bytes_sent} bytes sent")
@@ -259,37 +291,39 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
 
                 ctrl_sock.sendall(f"RETR {args}\r\n".encode())
                 initial_reply = recv_reply(ctrl_sock)
-                print(f"<<  {initial_reply}")
+                console.print(f"<<  {initial_reply}")
                 
                 if initial_reply.startswith("150"):
                     out_path = Path(args).name
-                    print(f"[STATUS] Downloading '{args}' → '{out_path}' ...")
+                    console.print(f"[STATUS] Downloading '{args}' → '{out_path}' ...")
                     if transfer_mode == "ACTIVE":
-                        bytes_recv = _recv_file_on_socket(recv_sock, Path(out_path))
+                        bytes_recv, success = _recv_file_on_socket(recv_sock, Path(out_path))
                     else:
-                        bytes_recv = _recv_file_udp(data_addr, Path(out_path))
+                        bytes_recv, success = _recv_file_udp(data_addr, Path(out_path))
                     final_reply = recv_reply(ctrl_sock)
-                    print(f"<<  {final_reply}")
+                    console.print(f"<<  {final_reply}")
                     
-                    if bytes_recv > 0:
-                        print("[STATUS] Comparing SHA-256 hash with the server...")
+                    if not success:
+                        console.print("[ERROR] Download incomplete — no FIN received (connection may have dropped)")
+                    elif bytes_recv > 0:
+                        console.print("[STATUS] Comparing SHA-256 hash with the server...")
                         try:
                             local_hash = sha256_file(Path(out_path))
                             ctrl_sock.sendall(f"HASH {args}\r\n".encode())
                             hash_reply = recv_reply(ctrl_sock)
-                            print(f"<<  {hash_reply}")
+                            console.print(f"<<  {hash_reply}")
                             if hash_reply.startswith("213"):
                                 server_hash = hash_reply.split()[-1]
                                 if local_hash == server_hash:
-                                    print(f"[VERIFIED]: SHA-256 matches perfectly! ({local_hash[:8]}...)")
+                                    console.print(f"[VERIFIED]: SHA-256 matches perfectly! ({local_hash[:8]}...)")
                                 else:
-                                    print(f"[ERROR]: Data is corrupted!\nClient: {local_hash}\nServer: {server_hash}")
+                                    console.print(f"[ERROR]: Data is corrupted!\nClient: {local_hash}\nServer: {server_hash}")
                         except Exception as e:
-                            print(f"[ERROR] Cannot verify Hash: {e}")
+                            console.print(f"[ERROR] Cannot verify Hash: {e}")
                     else:
-                        print("[ERROR] No data received (check server logs)")
+                        console.print("[ERROR] No data received (check server logs)")
                 else:
-                    print("[ERROR] Download aborted.")
+                    console.print("[ERROR] Download aborted.")
             
             elif cmd in ("LIST", "NLST"):
                 ctrl_sock.sendall((raw + "\r\n").encode())
