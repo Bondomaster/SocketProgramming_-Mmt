@@ -32,7 +32,6 @@ if TYPE_CHECKING:
 from .session import check_credentials, resolve_path
 from common.rdt_sender import send_file
 from common.rdt_receiver import recv_file
-from common.hashutil import sha256_file
 log = logging.getLogger("ftp-server")
 
 
@@ -606,17 +605,3 @@ def cmd_port(session: "Session", args: str) -> tuple[int, str]:
         return 200, "PORT command successful"
     except Exception:
         return 501, "Syntax error in parameters"
-
-@command("HASH")
-def cmd_hash(session: "Session", args: str) -> tuple[int, str]:
-    err = _require_auth(session)
-    if err:
-        return err
-    filename = args.strip()
-    if not filename:
-        return 501, "Syntax error: filename required"
-    target = resolve_path(session, filename)
-    if target is None or not target.is_file():
-        return 550, f"File unavailable: {filename}"
-    digest = sha256_file(target)
-    return 213, f"SHA-256 {digest}"
