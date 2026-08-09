@@ -19,7 +19,6 @@ from pathlib import Path
 from common.protocol import recv_reply
 from common.rdt_sender import send_file, make_fault_injector
 from common.rdt_receiver import recv_file
-from common.hashutil import sha256_file
 
 try:
     from rich.console import Console

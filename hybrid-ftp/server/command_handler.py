@@ -7,7 +7,7 @@ Implements all FTP commands:
   Basic:    USER, PASS, QUIT, NOOP, PWD, TYPE, STAT, SIZE, MDTM, HELP, SYST
   Advanced: CWD, CDUP, MKD, RMD, LIST, NLST, DELE, RNFR, RNTO, PORT, PASV,
             STOR, RETR, APPE, STOU, MODE, ABOR
-  Excellent: HASH (SHA-256 integrity check)
+  Excellent: Item 1 — Custom Reliable UDP Layer (Stop-and-Wait)
 
 Each handler has the signature:
     (session: Session, args: str) -> tuple[int, str]

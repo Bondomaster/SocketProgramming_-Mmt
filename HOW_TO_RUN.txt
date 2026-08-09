@@ -91,7 +91,6 @@ Tuỳ chọn:
    ftp> STOR D:\Pictures\photo.jpg
 
    → Thanh tiến trình "Uploading..." sẽ hiện ra
-   → Tự động kiểm tra SHA-256 sau khi upload xong
 
 --- Download file (RETR) ---
    ftp> RETR <tên_file_trên_server>
@@ -100,7 +99,6 @@ Tuỳ chọn:
    ftp> RETR sample.txt
 
    → Thanh tiến trình "Downloading..." sẽ hiện ra
-   → Tự động kiểm tra SHA-256 để xác nhận tính toàn vẹn
 
 --- Upload ghi đè nối tiếp (APPE) ---
    ftp> APPE <tên_file>
@@ -119,7 +117,6 @@ Tuỳ chọn:
    ftp> DELE sample.txt          ← Xoá file
    ftp> RNFR sample.txt          ← Chọn file để đổi tên
    ftp> RNTO new_name.txt        ← Đổi tên thành tên mới
-   ftp> HASH sample.txt          ← Lấy SHA-256 hash từ server
 
 ================================================================================
  7. CHẾ ĐỘ TRUYỀN: PASSIVE vs ACTIVE
@@ -174,7 +171,6 @@ Tuỳ chọn:
    ftp> STOR sample.txt
 
    → Quan sát: thanh tiến trình chậm hơn do retransmit
-   → SHA-256 vẫn phải khớp = dữ liệu toàn vẹn
 
 --- Test thủ công: giả lập hỏng gói 20% ---
 
@@ -185,7 +181,6 @@ Tuỳ chọn:
    ftp> STOR sample.txt
 
    → CRC32 phát hiện gói hỏng, sender tự retransmit
-   → SHA-256 vẫn khớp = dữ liệu toàn vẹn
 
 --- Test thủ công: giả lập cả mất gói + hỏng gói ---
 
@@ -247,7 +242,7 @@ Tuỳ chọn:
    ftp> USER admin
    ftp> PASS 1234
    ftp> STOR sample.txt
-   REM → SHA-256 vẫn khớp dù mất gói 30%!
+   REM → Quan sát tiến trình retransmit khi có rớt mạng!
 
 ================================================================================
  10. CẤU TRÚC PROJECT
@@ -265,8 +260,7 @@ Tuỳ chọn:
    │   ├── protocol.py          ← TCP wire format (format_reply, read_line)
    │   ├── rdt_packet.py        ← Header 16 byte + CRC32 checksum
    │   ├── rdt_sender.py        ← Stop-and-Wait sender (ACK/retransmit)
-   │   ├── rdt_receiver.py      ← Stop-and-Wait receiver (gói trùng/FIN)
-   │   └── hashutil.py          ← SHA-256 hash utility
+   │   └── rdt_receiver.py      ← Stop-and-Wait receiver (gói trùng/FIN)
    ├── ftp_root/                ← Thư mục sandbox FTP
    │   └── sample.txt
    └── tests/
