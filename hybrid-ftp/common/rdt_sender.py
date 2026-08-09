@@ -127,7 +127,19 @@ def send_file(
                 if simulate_faults:
                     simulate_faults(sock, pkt, dest_addr)
                 else:
-                    sock.sendto(pkt, dest_addr)
+                    # ---- Cố tình tạo lỗi để test ----
+                    if i == 1 and attempts == 0:
+                        print(f"\n[SENDER] Chủ động gửi GÓI TIN BỊ LỖI (corrupt) cho chunk {i}, seq={seq}...", file=sys.stderr)
+                        bad_pkt = bytearray(pkt)
+                        if len(bad_pkt) > 16: bad_pkt[16] ^= 0xFF
+                        sock.sendto(bytes(bad_pkt), dest_addr)
+                    else:
+                        sock.sendto(pkt, dest_addr)
+                        if i == 0 and attempts == 0:
+                            print(f"\n[SENDER] Chủ động gửi TRÙNG GÓI TIN cho chunk {i}, seq={seq}...", file=sys.stderr)
+                            sock.sendto(pkt, dest_addr)
+                            time.sleep(0.1)
+                    # ---------------------------------
 
                 # --- wait for ACK ---
                 try:

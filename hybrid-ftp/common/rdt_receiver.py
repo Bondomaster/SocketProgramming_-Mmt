@@ -94,6 +94,7 @@ def recv_file(sock: socket.socket, out_path) -> bool:
                 seq, _, flags, payload, ok = unpack_packet(data)
 
                 if not ok:
+                    print(f"[CORRUPT] Phát hiện gói tin lỗi dữ liệu (sai checksum) — drop silently", file=sys.stderr)
                     # Corrupt packet — drop silently, do NOT send ACK
                     # Sender will timeout and retransmit
                     continue
@@ -113,7 +114,7 @@ def recv_file(sock: socket.socket, out_path) -> bool:
                     _update(bytes_written)
                 else:
                     # Duplicate packet (our previous ACK was lost in transit)
-                    # Do NOT write again — but MUST ACK so sender stops retransmitting
+                    print(f"[DUPLICATE] seq={seq} == last acked, expected={expected_seq} — không ghi lại, chỉ ACK", file=sys.stderr)
                     pass  # fall through to ACK below
 
                 ack = pack_packet(0, seq, FLAG_ACK, b"")
