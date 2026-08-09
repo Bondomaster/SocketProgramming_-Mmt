@@ -94,6 +94,7 @@ def recv_file(sock: socket.socket, out_path) -> bool:
                 seq, _, flags, payload, ok = unpack_packet(data)
 
                 if not ok:
+                    print(f"[CORRUPT] Phát hiện gói tin lỗi dữ liệu (sai checksum) — drop silently", file=sys.stderr)
                     # Corrupt packet — drop silently, do NOT send ACK
                     # Sender will timeout and retransmit
                     continue
