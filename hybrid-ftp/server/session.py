@@ -1,15 +1,13 @@
 """
 server/session.py
 =================
-Session dataclass — per-client state for the Basic Level FTP server.
+Session dataclass — per-client state for the Hybrid FTP server.
 
 Each accepted TCP connection gets its own Session instance that tracks
-authentication state, current working directory, and transfer type.
+authentication state, current working directory, transfer type, and
+Active/Passive mode settings.
 """
 
-from dataclasses import dataclass, field
-from pathlib import Path
-import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 import socket

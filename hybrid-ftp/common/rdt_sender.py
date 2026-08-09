@@ -16,14 +16,43 @@ debug — here we use alternating 0/1 to strictly match the spec example.
 """
 
 import socket
+import sys
 import time
 import random
 from .rdt_packet import pack_packet, unpack_packet, FLAG_ACK, FLAG_FIN
-from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 
 MSS = 1024
 RTO = 1.0          # Retransmission timeout (seconds) — fixed for Stop-and-Wait
 MAX_RETRIES = 15   # Hard limit: after this many timeouts on one packet, raise
+
+
+# ---------------------------------------------------------------------------
+# Optional rich progress bar — falls back to plain-text if not installed
+# ---------------------------------------------------------------------------
+try:
+    from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+    _HAS_RICH = True
+except ImportError:
+    _HAS_RICH = False
+
+
+class _PlainProgress:
+    """Minimal fallback when ``rich`` is not installed."""
+
+    def __init__(self, total: int, label: str = "Progress"):
+        self._total = total
+        self._label = label
+
+    def update(self, completed: int) -> None:
+        if self._total > 0:
+            pct = completed * 100 // self._total
+            sys.stderr.write(f"\r{self._label}: {completed}/{self._total} ({pct}%)")
+            sys.stderr.flush()
+            if completed >= self._total:
+                sys.stderr.write("\n")
+
+    def close(self) -> None:
+        sys.stderr.write("\n")
 
 
 def make_fault_injector(drop_rate: float = 0.0, corrupt_rate: float = 0.0):
@@ -59,15 +88,35 @@ def send_file(
     retransmits = 0
     sock.settimeout(RTO)
 
-    with Progress(
-        TextColumn("[bold blue]Uploading..."),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeRemainingColumn(),
-        transient=True,
-    ) as progress:
-        task = progress.add_task("upload", total=len(chunks))
+    N = len(chunks)
 
+    # --- set up progress ---
+    if _HAS_RICH:
+        ctx = Progress(
+            TextColumn("[bold blue]Uploading..."),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            transient=True,
+        )
+        progress = ctx.__enter__()
+        task = progress.add_task("upload", total=N)
+
+        def _update(completed):
+            progress.update(task, completed=completed)
+
+        def _close():
+            ctx.__exit__(None, None, None)
+    else:
+        plain = _PlainProgress(N, "Uploading")
+
+        def _update(completed):
+            plain.update(completed)
+
+        def _close():
+            plain.close()
+
+    try:
         for i, chunk in enumerate(chunks):
             pkt = pack_packet(seq, 0, 0, chunk)
             attempts = 0
@@ -96,7 +145,7 @@ def send_file(
                         )
 
             seq = 1 - seq  # alternate 0↔1
-            progress.update(task, completed=i + 1)
+            _update(i + 1)
 
         # --- Send FIN — also requires an ACK (Stop-and-Wait for FIN too) ---
         fin_pkt = pack_packet(seq, 0, FLAG_FIN, b"")
@@ -117,5 +166,7 @@ def send_file(
                 retransmits += 1
                 if attempts > MAX_RETRIES:
                     raise ConnectionError("No ACK for FIN packet — transfer aborted")
+    finally:
+        _close()
 
     return retransmits

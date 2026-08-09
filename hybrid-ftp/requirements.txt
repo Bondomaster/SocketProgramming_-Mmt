@@ -1,0 +1,10 @@
+# Hybrid FTP — Dependencies
+#
+# Core: Python 3.10+ standard library only (socket, threading, struct, zlib, hashlib).
+# No third-party FTP/networking/transfer libraries are used.
+#
+# Optional: "rich" is used ONLY for terminal UI (colored output, progress bars).
+# The application works correctly without it — falls back to plain print().
+# It is NOT a networking/transfer library and does not affect protocol logic.
+
+rich>=13.0

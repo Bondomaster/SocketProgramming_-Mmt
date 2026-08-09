@@ -1,19 +1,23 @@
 """
 server/command_handler.py
 ==========================
-FTP command dispatch table — Basic Level.
+FTP command dispatch table — Advanced + Excellent Level.
 
-Implements all commands required by the Basic Level spec:
-  USER, PASS, QUIT, NOOP, PWD, TYPE, STAT, SIZE, MDTM, HELP, RETR, STOR
+Implements all FTP commands:
+  Basic:    USER, PASS, QUIT, NOOP, PWD, TYPE, STAT, SIZE, MDTM, HELP, SYST
+  Advanced: CWD, CDUP, MKD, RMD, LIST, NLST, DELE, RNFR, RNTO, PORT, PASV,
+            STOR, RETR, APPE, STOU, MODE, ABOR
+  Excellent: HASH (SHA-256 integrity check)
 
 Each handler has the signature:
     (session: Session, args: str) -> tuple[int, str]
 and returns an FTP reply code + message.
 
-UDP Data Channel (Basic Level — fixed ports, no Active/Passive switching):
-  - Server listens on DATA_PORT (2122) for incoming STOR data
-  - Server sends RETR data to client at CLIENT_DATA_PORT (2123)
-  - EOF is signalled with an empty datagram b""
+UDP Data Channel:
+  - Passive Mode: server binds ephemeral UDP port, client sends to it.
+  - Active Mode:  client binds UDP port (PORT), server sends READY handshake
+                  with ephemeral port for upload (STOR/APPE/STOU).
+  - All transfers use Stop-and-Wait RDT (ACK/retransmit/FIN).
 """
 
 from __future__ import annotations
@@ -32,8 +36,6 @@ from common.hashutil import sha256_file
 log = logging.getLogger("ftp-server")
 
 
-DATA_PORT = 2122        # Server's UDP port (STOR: server listens here)
-CLIENT_DATA_PORT = 2123 # Client's UDP port (RETR: client listens here)
 CHUNK_SIZE = 1024       # bytes per UDP datagram for file transfer
 
 Handler = Callable[["Session", str], tuple[int, str]]
@@ -109,6 +111,9 @@ def cmd_type(session: "Session", args: str) -> tuple[int, str]:
 @command("STAT")
 def cmd_stat(session: "Session", args: str) -> tuple[int, str]:
     if args:
+        err = _require_auth(session)
+        if err:
+            return err
         target = resolve_path(session, args.strip())
         if target is None or not target.exists():
             return 550, "File unavailable" 
@@ -233,19 +238,6 @@ def cmd_rnto(session: "Session", args: str) -> tuple[int, str]:
         session.rename_from = None
         return 451, f"Requested action aborted: {exc}"
 
-def _open_server_data_sock() -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", DATA_PORT))
-    sock.settimeout(10.0)   # 10 s receive timeout — avoids hanging forever
-    return sock
-
-
-def _open_client_data_sock(client_ip: str) -> tuple[socket.socket, tuple[str, int]]:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    client_addr = (client_ip, CLIENT_DATA_PORT)
-    return sock, client_addr
-
 def _get_data_socket_and_peer(session: "Session") -> tuple[socket.socket | None, tuple[str, int] | None, bool]:
     if session.data_mode == "PASSIVE" and session.pasv_sock:
         return session.pasv_sock, None, True
@@ -281,22 +273,27 @@ def _send_over_data_channel(session: "Session", data: bytes) -> None:
             session.data_mode = "NONE"
         elif sock and not is_pasv:
             sock.close()
-            session.data_mode = "NONE"
+            # Active Mode: keep data_mode="ACTIVE" so PORT persists across transfers
 
 
 def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "wb") -> tuple[int, bool]:
     """Receive a file over the active/passive UDP data channel using Stop-and-Wait RDT.
 
     Returns (bytes_received, success) where success=True only if recv_file() saw a FIN.
+
+    Active Mode fix: binds to ephemeral port (0) instead of fixed DATA_PORT,
+    then sends a READY packet to the client so it discovers our port.
+    This prevents port collisions when multiple clients use Active Mode.
     """
     sock, _, is_pasv = _get_data_socket_and_peer(session)
 
-    if not is_pasv and session.data_mode != "PASSIVE" and sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind(("0.0.0.0", DATA_PORT))
-        except OSError:
-            pass
+    if not is_pasv and session.data_mode == "ACTIVE" and sock and session.data_peer:
+        # Active Mode: bind to ephemeral port (NOT fixed 2122!) for session isolation
+        sock.bind(("0.0.0.0", 0))
+        # Send READY to client so it knows our ephemeral port
+        sock.sendto(b"READY", session.data_peer)
+        log.info("ACTIVE STOR: ephemeral port %d, sent READY to %s:%d",
+                 sock.getsockname()[1], *session.data_peer)
 
     total_bytes = 0
     success = False
@@ -312,7 +309,7 @@ def _recv_over_data_channel(session: "Session", target_path: Path, mode: str = "
                 session.data_mode = "NONE"
             else:
                 sock.close()
-                session.data_mode = "NONE"
+                # Active Mode: keep data_mode="ACTIVE" so PORT persists across transfers
     return total_bytes, success
 
 @command("RETR")
@@ -370,7 +367,7 @@ def cmd_retr(session: "Session", args: str) -> tuple[int, str]:
             session.data_mode = "NONE"
         elif sock and not is_pasv:
             sock.close()
-            session.data_mode = "NONE"
+            # Active Mode: keep data_mode="ACTIVE" so PORT persists across transfers
 
 
 @command("STOR")

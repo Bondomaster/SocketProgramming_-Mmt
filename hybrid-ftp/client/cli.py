@@ -20,11 +20,20 @@ from common.protocol import recv_reply
 from common.rdt_sender import send_file, make_fault_injector
 from common.rdt_receiver import recv_file
 from common.hashutil import sha256_file
-from rich.console import Console
 
-console = Console()
+try:
+    from rich.console import Console
+    console = Console()
+except ImportError:
+    # Fallback: rich not installed — use plain print
+    class _PlainConsole:
+        @staticmethod
+        def print(*args, **kwargs):
+            kwargs.pop("end", None)  # rich supports end=, print does too
+            print(*args, **kwargs)
+    console = _PlainConsole()
+
 CHUNK_SIZE = 1024
-SERVER_DATA_PORT = 2122
 
 # ---------------------------------------------------------------------------
 # UDP helpers (updated for Stop-and-Wait API)
@@ -196,7 +205,10 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
 
         if cmd in ("STOR", "RETR", "LIST", "NLST", "APPE", "STOU"):
             if transfer_mode == "ACTIVE":
-                data_addr = (host, SERVER_DATA_PORT)
+                # Active Mode: data_addr for upload (STOR/APPE/STOU) will be
+                # resolved via READY handshake after server sends 150.
+                # For download (RETR/LIST/NLST), server sends TO active_sock.
+                data_addr = None  # set per-transfer for uploads
                 recv_sock = active_sock
             else:
                 ctrl_sock.sendall(b"PASV\r\n")
@@ -221,6 +233,18 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
 
                 if initial_reply.startswith("150"):
                     console.print(f"[STATUS] Uploading '{local_path.name}' ({file_size} bytes) ...")
+                    # Active Mode: wait for READY from server to learn ephemeral port
+                    if transfer_mode == "ACTIVE":
+                        try:
+                            active_sock.settimeout(5.0)
+                            _, server_data_addr = active_sock.recvfrom(1024)
+                            data_addr = server_data_addr
+                            console.print(f"[STATUS] Active Mode: server data port = {server_data_addr[1]}")
+                        except socket.timeout:
+                            console.print("[ERROR] Active Mode: Timeout waiting for server READY")
+                            final_reply = recv_reply(ctrl_sock)
+                            console.print(f"<<  {final_reply}")
+                            continue
                     try:
                         bytes_sent = _send_file_udp(data_addr, local_path, simulate_faults=fault_injector)
                     except ConnectionError as exc:
@@ -269,6 +293,18 @@ def run_client(host: str, port: int, drop_rate: float = 0.0, corrupt_rate: float
 
                 if initial_reply.startswith("150"):
                     console.print(f"[STATUS] Sending '{local_path.name}' ({file_size} bytes) via {cmd} ...")
+                    # Active Mode: wait for READY from server to learn ephemeral port
+                    if transfer_mode == "ACTIVE":
+                        try:
+                            active_sock.settimeout(5.0)
+                            _, server_data_addr = active_sock.recvfrom(1024)
+                            data_addr = server_data_addr
+                            console.print(f"[STATUS] Active Mode: server data port = {server_data_addr[1]}")
+                        except socket.timeout:
+                            console.print(f"[ERROR] Active Mode: Timeout waiting for server READY")
+                            final_reply = recv_reply(ctrl_sock)
+                            console.print(f"<<  {final_reply}")
+                            continue
                     try:
                         bytes_sent = _send_file_udp(data_addr, local_path, simulate_faults=fault_injector)
                     except ConnectionError as exc:

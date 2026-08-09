@@ -17,10 +17,30 @@ Return value: True  = file received completely (saw FIN)
 """
 
 import socket
+import sys
 from .rdt_packet import pack_packet, unpack_packet, FLAG_ACK, FLAG_FIN
-from rich.progress import Progress, TextColumn, BarColumn, DownloadColumn
 
 IDLE_TIMEOUT = 30.0   # seconds of total silence before giving up
+
+# ---------------------------------------------------------------------------
+# Optional rich progress bar — falls back to plain-text if not installed
+# ---------------------------------------------------------------------------
+try:
+    from rich.progress import Progress, TextColumn, BarColumn, DownloadColumn
+    _HAS_RICH = True
+except ImportError:
+    _HAS_RICH = False
+
+
+class _PlainDownloadProgress:
+    """Minimal fallback when ``rich`` is not installed."""
+
+    def update(self, completed: int) -> None:
+        sys.stderr.write(f"\rDownloading... {completed} bytes")
+        sys.stderr.flush()
+
+    def close(self) -> None:
+        sys.stderr.write("\n")
 
 
 def recv_file(sock: socket.socket, out_path) -> bool:
@@ -33,15 +53,33 @@ def recv_file(sock: socket.socket, out_path) -> bool:
     peer_addr = None
     sock.settimeout(IDLE_TIMEOUT)
 
-    with Progress(
-        TextColumn("[bold green]Downloading..."),
-        BarColumn(),
-        DownloadColumn(),
-        transient=True,
-    ) as progress:
-        task = progress.add_task("download", total=None)  # indeterminate until FIN
-        bytes_written = 0
+    # --- set up progress ---
+    if _HAS_RICH:
+        ctx = Progress(
+            TextColumn("[bold green]Downloading..."),
+            BarColumn(),
+            DownloadColumn(),
+            transient=True,
+        )
+        progress = ctx.__enter__()
+        task = progress.add_task("download", total=None)
 
+        def _update(val):
+            progress.update(task, completed=val)
+
+        def _close():
+            ctx.__exit__(None, None, None)
+    else:
+        plain = _PlainDownloadProgress()
+
+        def _update(val):
+            plain.update(val)
+
+        def _close():
+            plain.close()
+
+    bytes_written = 0
+    try:
         with open(out_path, "wb") as out:
             while True:
                 try:
@@ -64,7 +102,7 @@ def recv_file(sock: socket.socket, out_path) -> bool:
                     # Transfer complete — ACK the FIN and signal success
                     ack = pack_packet(0, seq, FLAG_ACK, b"")
                     sock.sendto(ack, peer_addr)
-                    progress.update(task, completed=bytes_written)
+                    _update(bytes_written)
                     return True
 
                 if seq == expected_seq:
@@ -72,7 +110,7 @@ def recv_file(sock: socket.socket, out_path) -> bool:
                     out.write(payload)
                     bytes_written += len(payload)
                     expected_seq = 1 - expected_seq  # alternate 0↔1
-                    progress.update(task, completed=bytes_written)
+                    _update(bytes_written)
                 else:
                     # Duplicate packet (our previous ACK was lost in transit)
                     # Do NOT write again — but MUST ACK so sender stops retransmitting
@@ -80,3 +118,5 @@ def recv_file(sock: socket.socket, out_path) -> bool:
 
                 ack = pack_packet(0, seq, FLAG_ACK, b"")
                 sock.sendto(ack, peer_addr)
+    finally:
+        _close()
