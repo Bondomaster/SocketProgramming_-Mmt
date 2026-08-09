@@ -128,6 +128,12 @@ def send_file(
                     simulate_faults(sock, pkt, dest_addr)
                 else:
                     sock.sendto(pkt, dest_addr)
+                    # ---- Cố tình gửi duplicate để test nhánh DUPLICATE bên receiver ----
+                    if i == 0 and attempts == 0:
+                        print(f"\n[SENDER] Chủ động gửi TRÙNG GÓI TIN cho chunk {i}, seq={seq}...", file=sys.stderr)
+                        sock.sendto(pkt, dest_addr)
+                        time.sleep(0.1) # Đợi 1 chút để receiver xử lý xong gói 1
+                    # ----------------------------------------------------------------------
 
                 # --- wait for ACK ---
                 try:

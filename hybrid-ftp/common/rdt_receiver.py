@@ -113,7 +113,7 @@ def recv_file(sock: socket.socket, out_path) -> bool:
                     _update(bytes_written)
                 else:
                     # Duplicate packet (our previous ACK was lost in transit)
-                    # Do NOT write again — but MUST ACK so sender stops retransmitting
+                    print(f"[DUPLICATE] seq={seq} == last acked, expected={expected_seq} — không ghi lại, chỉ ACK", file=sys.stderr)
                     pass  # fall through to ACK below
 
                 ack = pack_packet(0, seq, FLAG_ACK, b"")
